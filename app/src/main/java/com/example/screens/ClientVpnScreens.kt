@@ -37,6 +37,7 @@ import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.VpnKey
+import androidx.compose.material.icons.filled.WifiFind
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -73,8 +74,10 @@ import com.example.database.SavedPeerEntity
 import com.example.model.DiscoveredHostPeer
 import com.example.model.HostPublicInfo
 import com.example.model.LiveTrafficSnapshot
+import com.example.model.OfflineP2pState
 import com.example.model.SharingMode
 import com.example.model.TunnelState
+import com.example.networking.transport.OfflineWifiDirectManager
 import com.example.qr.QrCodeGenerator
 import com.example.settings.WiFiShareSettings
 import com.example.ui.components.GlassCard
@@ -102,19 +105,25 @@ fun ClientModeScreen(
     hostInfo: HostPublicInfo?,
     traffic: LiveTrafficSnapshot,
     isVpnActive: Boolean,
+    isClientServiceRunning: Boolean,
     discoveredHosts: List<DiscoveredHostPeer>,
     isScanningNearby: Boolean,
+    offlineP2pState: OfflineP2pState,
     savedHosts: List<SavedPeerEntity>,
     onStartNearbyScan: () -> Unit,
     onStopNearbyScan: () -> Unit,
+    onScanOfflineWifiDirect: () -> Unit,
+    onConnectOfflineWifiDirectPeer: (String) -> Unit,
     onSelectMode: (SharingMode) -> Unit,
     onRequestJoin: (rawCodeOrUri: String, hostIp: String, hostPort: Int?) -> Unit,
+    onRequestOfflineInternet: (note: String, hostIp: String, hostPort: Int?) -> Unit,
     onOpenQrScanner: () -> Unit,
     onOpenBrowser: () -> Unit,
     onOpenVpnScreen: () -> Unit,
     onDisconnect: () -> Unit,
     onBack: (() -> Unit)? = null
 ) {
+    val context = LocalContext.current
     val semantic = LocalWiFiShareColors.current
     val initialParsed = remember(initialCode) { QrCodeGenerator.parseShareInvite(initialCode) }
     var codeInput by remember(initialCode) {
@@ -126,6 +135,27 @@ fun ClientModeScreen(
     var hostIpInput by remember(initialCode) { mutableStateOf(initialParsed?.hostIp.orEmpty()) }
     var hostPortInput by remember(initialCode) {
         mutableStateOf((initialParsed?.hostPort ?: defaultPort).toString())
+    }
+    var offlineNoteInput by remember { mutableStateOf("") }
+    var p2pHint by remember { mutableStateOf<String?>(null) }
+
+    val p2pPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            p2pHint = null
+            onScanOfflineWifiDirect()
+        } else {
+            p2pHint = "Nearby Wi-Fi permission denied. Offline LAN / Hotspot discovery still works."
+        }
+    }
+
+    LaunchedEffect(offlineP2pState.groupOwnerIp, offlineP2pState.isGroupActive) {
+        if (offlineP2pState.isGroupActive && !offlineP2pState.isGroupOwner &&
+            offlineP2pState.groupOwnerIp.isNotBlank() && hostIpInput.isBlank()
+        ) {
+            hostIpInput = offlineP2pState.groupOwnerIp
+        }
     }
 
     val isClientConnected = (tunnelState as? TunnelState.Connected)?.role == "CLIENT"
@@ -170,7 +200,17 @@ fun ClientModeScreen(
                 // Sharing Code / Direct Endpoint Card
                 GlassCard(modifier = Modifier.fillMaxWidth()) {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("Enter Host Code or Invite Link", style = MaterialTheme.typography.titleMedium)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Enter Host Code or Invite Link", style = MaterialTheme.typography.titleMedium)
+                            if (isClientServiceRunning) {
+                                StatusPill("BG TUNNEL ON", semantic.success)
+                            }
+                        }
+
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -210,7 +250,7 @@ fun ClientModeScreen(
                             OutlinedTextField(
                                 value = hostIpInput,
                                 onValueChange = { hostIpInput = it },
-                                label = { Text("Host IP (auto on LAN/QR)") },
+                                label = { Text("Host IP (auto on LAN/QR/P2P)") },
                                 singleLine = true,
                                 modifier = Modifier
                                     .weight(2f)
@@ -229,7 +269,7 @@ fun ClientModeScreen(
                         }
 
                         // Access Mode Selection
-                        Text("Choose Access Mode", style = MaterialTheme.typography.titleSmall)
+                        Text("Choose Access Mode (Background Ready)", style = MaterialTheme.typography.titleSmall)
                         SharingMode.entries.forEach { mode ->
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -251,7 +291,7 @@ fun ClientModeScreen(
                             }
                         }
 
-                        if (!isClientConnected) {
+                        if (!isClientConnected && tunnelState !is TunnelState.Reconnecting) {
                             Button(
                                 onClick = {
                                     onRequestJoin(codeInput, hostIpInput, hostPortInput.toIntOrNull())
@@ -267,7 +307,7 @@ fun ClientModeScreen(
                             ) {
                                 Icon(Icons.Default.VpnKey, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.size(8.dp))
-                                Text("Request Direct Connection")
+                                Text("Connect (Online or Offline Link)")
                             }
                         } else {
                             Button(
@@ -287,16 +327,104 @@ fun ClientModeScreen(
                     }
                 }
 
+                // Direct Offline Request Card (Zero Sharing Code Required)
+                GlassCard(
+                    modifier = Modifier.fillMaxWidth(),
+                    borderColor = semantic.cobaltAccent.copy(alpha = 0.45f)
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(Icons.Default.WifiFind, contentDescription = null, tint = semantic.cyanAccent)
+                                Text("Request Internet Offline", style = MaterialTheme.typography.titleMedium)
+                            }
+                            StatusPill("NO CODE NEEDED", semantic.cyanAccent)
+                        }
+                        Text(
+                            text = "No sharing code? Broadcast an offline request over local Wi-Fi, Hotspot, or Wi-Fi Direct so any nearby Host can accept and share internet with you.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        OutlinedTextField(
+                            value = offlineNoteInput,
+                            onValueChange = { offlineNoteInput = it.take(120) },
+                            label = { Text("Note for Host (optional, e.g. Need maps access)") },
+                            singleLine = true,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("client_offline_note_input")
+                        )
+                        Button(
+                            onClick = {
+                                onRequestOfflineInternet(
+                                    offlineNoteInput,
+                                    hostIpInput,
+                                    hostPortInput.toIntOrNull()
+                                )
+                            },
+                            enabled = !isClientConnected &&
+                                tunnelState !is TunnelState.Handshaking &&
+                                tunnelState !is TunnelState.AwaitingHostApproval &&
+                                tunnelState !is TunnelState.Reconnecting,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(50.dp)
+                                .testTag("client_request_offline_btn"),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = semantic.cobaltAccent,
+                                contentColor = MaterialTheme.colorScheme.onPrimary
+                            )
+                        ) {
+                            Icon(Icons.Default.Radar, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.size(8.dp))
+                            Text("Request Internet Offline")
+                        }
+                    }
+                }
+
                 // Live Connection Status / Host Info
                 when (tunnelState) {
                     is TunnelState.Handshaking -> {
                         GlassCard(modifier = Modifier.fillMaxWidth()) {
+                            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                ) {
+                                    CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                                    Text(tunnelState.stage, style = MaterialTheme.typography.bodyMedium)
+                                }
+                                OutlinedButton(
+                                    onClick = onDisconnect,
+                                    modifier = Modifier.testTag("client_cancel_handshake_btn")
+                                ) {
+                                    Text("Cancel Offline Search")
+                                }
+                            }
+                        }
+                    }
+                    is TunnelState.Reconnecting -> {
+                        GlassCard(
+                            modifier = Modifier.fillMaxWidth(),
+                            borderColor = semantic.warning.copy(alpha = 0.6f)
+                        ) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
-                                CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
-                                Text(tunnelState.stage, style = MaterialTheme.typography.bodyMedium)
+                                CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+                                Column {
+                                    Text("Reconnecting in background (Attempt ${tunnelState.attempt})", style = MaterialTheme.typography.titleSmall)
+                                    Text(tunnelState.reason, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
                             }
                         }
                     }
@@ -308,7 +436,7 @@ fun ClientModeScreen(
                             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 StatusPill("Awaiting Host Authorization", semantic.warning)
                                 Text(
-                                    "Direct request sent to ${tunnelState.hostLabel} (${tunnelState.sessionCode}). Waiting for the Host to tap Approve.",
+                                    "Direct request sent to ${tunnelState.hostLabel} (${tunnelState.sessionCode}). Waiting in background for the Host to tap Accept.",
                                     style = MaterialTheme.typography.bodyMedium
                                 )
                                 OutlinedButton(
@@ -347,7 +475,10 @@ fun ClientModeScreen(
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    StatusPill("Tunnel Connected", semantic.success)
+                                    StatusPill(
+                                        if (isClientServiceRunning) "BG Tunnel Connected" else "Tunnel Connected",
+                                        semantic.success
+                                    )
                                     Text(
                                         formatDuration(durationSec),
                                         style = MaterialTheme.typography.labelMedium.copy(fontFamily = JetBrainsMonoFontFamily)
@@ -396,7 +527,7 @@ fun ClientModeScreen(
                     else -> Unit
                 }
 
-                // Nearby LAN Hosts (Serverless NSD / mDNS Discovery)
+                // Nearby LAN / Hotspot Hosts (Serverless NSD + Offline UDP Beacon)
                 GlassCard(modifier = Modifier.fillMaxWidth()) {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Row(
@@ -420,8 +551,8 @@ fun ClientModeScreen(
                         }
                         if (discoveredHosts.isEmpty()) {
                             Text(
-                                if (isScanningNearby) "Listening for nearby WiFiShare Hosts via mDNS..."
-                                else "Tap Scan LAN when both phones share the same Wi-Fi or Hotspot.",
+                                if (isScanningNearby) "Listening for nearby WiFiShare Hosts via mDNS & offline UDP beacons..."
+                                else "Tap Scan LAN when both phones share an offline Wi-Fi router, Hotspot, or Wi-Fi Direct group.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -436,6 +567,56 @@ fun ClientModeScreen(
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
                                     Text("${peer.hostName} (${peer.sharingCode}) • ${peer.hostIp}:${peer.hostPort}")
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Offline Wi-Fi Direct Discovery (Zero Router / Zero Internet)
+                GlassCard(modifier = Modifier.fillMaxWidth()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(Icons.Default.WifiFind, contentDescription = null, tint = semantic.cobaltAccent)
+                                Text("Offline Wi-Fi Direct P2P", style = MaterialTheme.typography.titleMedium)
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    if (OfflineWifiDirectManager.hasRequiredPermission(context)) {
+                                        onScanOfflineWifiDirect()
+                                    } else {
+                                        p2pPermissionLauncher.launch(OfflineWifiDirectManager.requiredPermission())
+                                    }
+                                },
+                                enabled = offlineP2pState.isSupported,
+                                modifier = Modifier.testTag("client_wifi_direct_scan_btn")
+                            ) {
+                                Text("Scan P2P")
+                            }
+                        }
+                        Text(
+                            text = offlineP2pState.statusMessage,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        p2pHint?.let { hint ->
+                            Text(hint, style = MaterialTheme.typography.bodySmall, color = semantic.warning)
+                        }
+                        if (offlineP2pState.peers.isNotEmpty()) {
+                            offlineP2pState.peers.forEach { peer ->
+                                OutlinedButton(
+                                    onClick = { onConnectOfflineWifiDirectPeer(peer.deviceAddress) },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("${peer.deviceName} • ${peer.statusLabel}")
                                 }
                             }
                         }

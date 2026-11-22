@@ -45,7 +45,9 @@ data class DirectJoinRequestPayload(
     val deviceName: String,
     val clientPublicKey: String,
     val requestedMode: String,
-    val stunEndpoint: String = "direct"
+    val stunEndpoint: String = "direct",
+    val isOfflineRequest: Boolean = false,
+    val requestNote: String = ""
 )
 
 @Serializable
@@ -57,14 +59,16 @@ data class DirectJoinPendingPayload(
     val permittedModes: List<String>,
     val maxDevices: Int,
     val activeDevices: Int,
-    val expiresAt: Long
+    val expiresAt: Long,
+    val sessionCode: String = ""
 )
 
 @Serializable
 data class DirectJoinApprovedPayload(
     val assignedIp: String,
     val hostPublicKey: String,
-    val permittedModes: List<String>
+    val permittedModes: List<String>,
+    val sessionCode: String = ""
 )
 
 @Serializable
@@ -190,7 +194,12 @@ class DirectHostGatewayServer(
     private val scope: CoroutineScope,
     private val onJoinRequested: (PendingJoinRequest) -> Unit,
     private val onPendingClosed: (Long) -> Unit,
-    private val onServerError: (Throwable) -> Unit
+    private val onServerError: (Throwable) -> Unit,
+    private val autoAcceptTrustedProvider: () -> Boolean = { false },
+    private val trustedDeviceUuidsProvider: () -> Set<String> = { emptySet() },
+    private val onAutoApproveRequested: ((PendingJoinRequest) -> Unit)? = null,
+    private val networkTypeProvider: () -> String = { networkType },
+    private val allowOpenOfflineRequestsProvider: () -> Boolean = { true }
 ) {
     private class PendingSocketEntry(
         val connectionId: Long,
@@ -235,6 +244,7 @@ class DirectHostGatewayServer(
                     while (isActive && isRunning) {
                         val clientSocket = ss.accept()
                         clientSocket.tcpNoDelay = true
+                        runCatching { clientSocket.keepAlive = true }
                         launch { handleIncomingSocket(clientSocket) }
                     }
                 } catch (e: Exception) {
@@ -268,8 +278,16 @@ class DirectHostGatewayServer(
                 String(reqBytes, Charsets.UTF_8)
             )
 
+            val isOpenOfflineReq = req.isOfflineRequest ||
+                req.sharingCode.equals(OFFLINE_REQUEST_CODE, ignoreCase = true)
             val nowSec = System.currentTimeMillis() / 1000L
-            if (!req.sharingCode.equals(sharingCode, ignoreCase = true)) {
+            if (isOpenOfflineReq) {
+                if (!allowOpenOfflineRequestsProvider()) {
+                    sendRejection(out, "Host requires a sharing code (open offline requests disabled).")
+                    socket.close()
+                    return
+                }
+            } else if (!req.sharingCode.equals(sharingCode, ignoreCase = true)) {
                 sendRejection(out, "Sharing code does not match this Host session.")
                 socket.close()
                 return
@@ -296,13 +314,14 @@ class DirectHostGatewayServer(
             // Send pending confirmation + Host public summary
             val pendingInfo = DirectJoinPendingPayload(
                 hostName = hostDisplayName,
-                networkType = networkType,
+                networkType = networkTypeProvider(),
                 hostPublicKey = hostPublicKeyB64,
                 stunEndpoint = stunEndpoint,
                 permittedModes = permitted.map { it.code },
                 maxDevices = maxDevicesProvider(),
                 activeDevices = activeDevicesCountProvider(),
-                expiresAt = expiresAtEpochSec
+                expiresAt = expiresAtEpochSec,
+                sessionCode = sharingCode
             )
             sendControlFrame(out, OP_JOIN_PENDING, controlJson.encodeToString(pendingInfo).toByteArray(Charsets.UTF_8))
             socket.soTimeout = 0
@@ -317,7 +336,9 @@ class DirectHostGatewayServer(
                 requestedMode = requestedMode,
                 clientPublicKeyB64 = req.clientPublicKey,
                 clientEndpoint = remoteEndpoint,
-                requestedAt = timestamp
+                requestedAt = timestamp,
+                isOfflineRequest = isOpenOfflineReq,
+                requestNote = req.requestNote
             )
 
             // Keep pending socket alive and detect early client cancel
@@ -340,7 +361,12 @@ class DirectHostGatewayServer(
             }
 
             pendingSockets[connId] = PendingSocketEntry(connId, socket, inp, out, pendingReq, keepaliveJob)
-            onJoinRequested(pendingReq)
+            val isTrustedClient = req.deviceUuid in trustedDeviceUuidsProvider()
+            if (autoAcceptTrustedProvider() && isTrustedClient && onAutoApproveRequested != null) {
+                onAutoApproveRequested.invoke(pendingReq)
+            } else {
+                onJoinRequested(pendingReq)
+            }
         } catch (e: Exception) {
             Log.w(TAG, "Incoming client handshake failed: ${e.message}")
             runCatching { socket.close() }
@@ -363,7 +389,8 @@ class DirectHostGatewayServer(
             val approved = DirectJoinApprovedPayload(
                 assignedIp = assignedIp,
                 hostPublicKey = hostPublicKeyB64,
-                permittedModes = permittedModesProvider().map { it.code }
+                permittedModes = permittedModesProvider().map { it.code },
+                sessionCode = sharingCode
             )
             sendControlFrame(entry.out, OP_JOIN_APPROVED, controlJson.encodeToString(approved).toByteArray(Charsets.UTF_8))
 
@@ -421,6 +448,7 @@ class DirectHostGatewayServer(
 
     companion object {
         private const val TAG = "DirectHostGatewayServer"
+        const val OFFLINE_REQUEST_CODE = "OFFLINE-REQUEST"
     }
 }
 
@@ -437,7 +465,9 @@ class DirectClientConnector(
     private val clientPublicKeyB64: String,
     private val requestedMode: SharingMode,
     private val stunEndpoint: String,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val isOfflineRequest: Boolean = false,
+    private val requestNote: String = ""
 ) {
     @Volatile
     private var activeSocket: Socket? = null
@@ -470,17 +500,20 @@ class DirectClientConnector(
             activeSocket = socket
             socket.connect(InetSocketAddress(InetAddress.getByName(hostIp), hostPort), 8_000)
             socket.tcpNoDelay = true
+            runCatching { socket.keepAlive = true }
 
             val out = DataOutputStream(socket.getOutputStream())
             val inp = DataInputStream(socket.getInputStream())
 
             val reqPayload = DirectJoinRequestPayload(
-                sharingCode = sharingCode,
+                sharingCode = sharingCode.ifBlank { DirectHostGatewayServer.OFFLINE_REQUEST_CODE },
                 deviceUuid = deviceUuid,
                 deviceName = deviceName,
                 clientPublicKey = clientPublicKeyB64,
                 requestedMode = requestedMode.code,
-                stunEndpoint = stunEndpoint
+                stunEndpoint = stunEndpoint,
+                isOfflineRequest = isOfflineRequest,
+                requestNote = requestNote
             )
             val reqBytes = controlJson.encodeToString(reqPayload).toByteArray(Charsets.UTF_8)
             synchronized(out) {
@@ -519,7 +552,8 @@ class DirectClientConnector(
                             permittedModes = permitted,
                             maxDevices = info.maxDevices,
                             activeDevices = info.activeDevices,
-                            expiresAtEpochSec = info.expiresAt
+                            expiresAtEpochSec = info.expiresAt,
+                            resolvedSharingCode = info.sessionCode
                         )
                         latestHostInfo = hostInfo
                         onAwaitingApproval(hostInfo)
@@ -539,8 +573,12 @@ class DirectClientConnector(
                             permittedModes = SharingMode.entries.toSet(),
                             maxDevices = 4,
                             activeDevices = 1,
-                            expiresAtEpochSec = 0L
-                        )).copy(hostPublicKeyB64 = approved.hostPublicKey)
+                            expiresAtEpochSec = 0L,
+                            resolvedSharingCode = approved.sessionCode
+                        )).copy(
+                            hostPublicKeyB64 = approved.hostPublicKey,
+                            resolvedSharingCode = approved.sessionCode.ifBlank { latestHostInfo?.resolvedSharingCode.orEmpty() }
+                        )
 
                         onApproved(hostInfo, approved.assignedIp) { cipher, accounting, onFrame, onErr ->
                             DirectSocketTunnelTransport(

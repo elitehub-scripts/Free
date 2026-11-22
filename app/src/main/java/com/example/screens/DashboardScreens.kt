@@ -33,6 +33,7 @@ import androidx.compose.material.icons.filled.SignalCellularAlt
 import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material.icons.filled.WifiFind
 import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -80,8 +81,10 @@ fun HomeDashboardScreen(
     traffic: LiveTrafficSnapshot,
     connectedPeersCount: Int,
     pendingRequestsCount: Int,
+    isBackgroundServiceActive: Boolean = false,
     onNavigateHost: () -> Unit,
     onNavigateClient: () -> Unit,
+    onRequestOfflineInternet: () -> Unit,
     onNavigateBrowser: () -> Unit,
     onNavigateDownloads: () -> Unit,
     onNavigateVpn: () -> Unit,
@@ -187,7 +190,10 @@ fun HomeDashboardScreen(
                                 is TunnelState.Idle -> "Standby" to MaterialTheme.colorScheme.onSurfaceVariant
                                 is TunnelState.Handshaking -> "Handshaking" to semantic.warning
                                 is TunnelState.AwaitingHostApproval -> "Awaiting Approval" to semantic.warning
-                                is TunnelState.Connected -> "${tunnelState.role} · Connected" to semantic.success
+                                is TunnelState.Connected -> {
+                                    val bgSuffix = if (isBackgroundServiceActive) " · BG" else ""
+                                    "${tunnelState.role} · Connected$bgSuffix" to semantic.success
+                                }
                                 is TunnelState.Reconnecting -> "Reconnecting" to semantic.warning
                                 is TunnelState.Error -> "Tunnel Error" to MaterialTheme.colorScheme.error
                             }
@@ -199,8 +205,16 @@ fun HomeDashboardScreen(
                                 else -> Icons.Default.WifiOff
                             }
                             StatusPill(
-                                label = if (networkInfo.isConnected) "${networkInfo.transport.name} (${networkInfo.localIp})" else "Offline",
-                                color = if (networkInfo.isConnected) semantic.cyanAccent else MaterialTheme.colorScheme.error,
+                                label = when {
+                                    networkInfo.isConnected -> "${networkInfo.transport.name} (${networkInfo.localIp})"
+                                    networkInfo.hasLocalLink -> "Offline LAN (${networkInfo.localIp})"
+                                    else -> "Offline"
+                                },
+                                color = when {
+                                    networkInfo.isConnected -> semantic.cyanAccent
+                                    networkInfo.hasLocalLink -> semantic.warning
+                                    else -> MaterialTheme.colorScheme.error
+                                },
                                 leadingIcon = netIcon
                             )
                         }
@@ -275,6 +289,21 @@ fun HomeDashboardScreen(
                     Icon(Icons.Default.VpnKey, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.size(8.dp))
                     Text("Client Mode")
+                }
+            }
+
+            if (tunnelState is TunnelState.Idle) {
+                OutlinedButton(
+                    onClick = onRequestOfflineInternet,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(50.dp)
+                        .testTag("dash_request_offline_btn"),
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Icon(Icons.Default.WifiFind, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.size(8.dp))
+                    Text("Request Internet Offline (Nearby Host)")
                 }
             }
 

@@ -1,0 +1,1573 @@
+package com.example.services
+
+import android.content.Context
+import android.content.Intent
+import android.net.VpnService
+import android.os.Build
+import android.util.Log
+import androidx.core.content.ContextCompat
+import com.example.authentication.LocalPasswordHasher
+import com.example.authentication.SecureCredentialStore
+import com.example.browser.BrowserStateHolder
+import com.example.database.LocalAccountEntity
+import com.example.database.SavedHostSessionEntity
+import com.example.database.SavedPeerEntity
+import com.example.database.WiFiShareDatabase
+import com.example.database.WiFiShareLocalRepository
+import com.example.diagnostics.AiDiagnosticsService
+import com.example.downloads.DownloadManagerEngine
+import com.example.model.ActiveNetworkInfo
+import com.example.model.AiDiagnosticUiState
+import com.example.model.AuthUserSession
+import com.example.model.ConnectedPeer
+import com.example.model.DiagnosticProbeResult
+import com.example.model.DiscoveredHostPeer
+import com.example.model.HostPublicInfo
+import com.example.model.LiveTrafficSnapshot
+import com.example.model.NearbyOfflineNeed
+import com.example.model.OfflineP2pState
+import com.example.model.PendingJoinRequest
+import com.example.model.SharingCodeState
+import com.example.model.SharingMode
+import com.example.model.TunnelState
+import com.example.networking.ConnectivityMonitor
+import com.example.networking.crypto.DecryptedTunnelFrame
+import com.example.networking.crypto.TunnelCrypto
+import com.example.networking.proxy.LocalTunnelStreamMux
+import com.example.networking.stun.StunClient
+import com.example.networking.transport.DirectClientConnector
+import com.example.networking.transport.DirectHostGatewayServer
+import com.example.networking.transport.DirectSocketTunnelTransport
+import com.example.networking.transport.LocalBeaconDiscovery
+import com.example.networking.transport.LocalNsdDiscovery
+import com.example.networking.transport.OfflineWifiDirectManager
+import com.example.networking.transport.TrafficAccounting
+import com.example.networking.transport.TunnelPeerTransport
+import com.example.networking.transport.TunnelWireCodec
+import com.example.qr.QrCodeGenerator
+import com.example.settings.SettingsDataStore
+import com.example.settings.WiFiShareSettings
+import com.example.vpn.HostGatewayForwarder
+import com.example.vpn.VpnRuntimeBridge
+import com.example.vpn.WiFiShareVpnService
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.security.KeyPair
+import java.security.SecureRandom
+import java.util.Locale
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Application-scoped runtime engine for WiFiShare.
+ * Lives outside Activity/ViewModel lifecycles so both Host sharing ("give connection")
+ * and Client tunnels ("get connection") continue running smoothly in the background and offline.
+ */
+class WiFiShareRuntime private constructor(context: Context) {
+
+    private val appContext = context.applicationContext
+    val runtimeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private val db = WiFiShareDatabase.getInstance(appContext)
+    val localRepo = WiFiShareLocalRepository(db)
+    val settingsStore = SettingsDataStore(appContext)
+    val credentialStore = SecureCredentialStore(appContext)
+    val connectivityMonitor = ConnectivityMonitor(appContext)
+    val nsdDiscovery = LocalNsdDiscovery(appContext)
+    val beaconDiscovery = LocalBeaconDiscovery(runtimeScope)
+    val browser = BrowserStateHolder()
+    val aiDiagnostics = AiDiagnosticsService()
+    val trafficAccounting = TrafficAccounting()
+
+    val wifiDirectManager: OfflineWifiDirectManager = OfflineWifiDirectManager(appContext) { isOwner, ownerIp ->
+        onWifiDirectGroupUpdated(isOwner, ownerIp)
+    }
+
+    val settings: StateFlow<WiFiShareSettings> = settingsStore.settingsFlow
+        .stateIn(runtimeScope, SharingStarted.Eagerly, WiFiShareSettings())
+
+    val activeNetwork: StateFlow<ActiveNetworkInfo> = connectivityMonitor.networkInfo
+    val liveTraffic: StateFlow<LiveTrafficSnapshot> = trafficAccounting.snapshot
+    val isVpnActive: StateFlow<Boolean> = VpnRuntimeBridge.isVpnRunning
+    val isHostServiceRunning: StateFlow<Boolean> = HostServiceBridge.isRunning
+    val isClientServiceRunning: StateFlow<Boolean> = ClientServiceBridge.isRunning
+    val offlineP2pState: StateFlow<OfflineP2pState> = wifiDirectManager.state
+
+    val discoveredHosts: StateFlow<List<DiscoveredHostPeer>> = combine(
+        nsdDiscovery.discoveredHosts,
+        beaconDiscovery.discoveredPeers
+    ) { nsd, beacon ->
+        val merged = LinkedHashMap<String, DiscoveredHostPeer>()
+        (nsd + beacon).forEach { peer ->
+            val key = "${peer.sharingCode}|${peer.hostIp}:${peer.hostPort}"
+            merged[key] = peer
+        }
+        merged.values.toList()
+    }.stateIn(runtimeScope, SharingStarted.Eagerly, emptyList())
+
+    val isNsdScanning: StateFlow<Boolean> = nsdDiscovery.isDiscovering
+    val nearbyOfflineNeeds: StateFlow<List<NearbyOfflineNeed>> = beaconDiscovery.nearbyOfflineNeeds
+
+    val savedHosts = localRepo.savedHosts
+    val savedClients = localRepo.savedClients
+    val hostSessions = localRepo.hostSessions
+    val bookmarks = localRepo.bookmarks
+    val history = localRepo.history
+    val downloads = localRepo.downloads
+    val trafficRecords = localRepo.trafficRecords
+    val tunnelEvents = localRepo.tunnelEvents
+
+    val dailyUpload = localRepo.observeDailyUpload()
+    val dailyDownload = localRepo.observeDailyDownload()
+    val monthlyUpload = localRepo.observeMonthlyUpload()
+    val monthlyDownload = localRepo.observeMonthlyDownload()
+    val aiUiState: StateFlow<AiDiagnosticUiState> = aiDiagnostics.uiState
+
+    private val _authSession = MutableStateFlow(loadStoredAuthSession())
+    val authSession: StateFlow<AuthUserSession> = _authSession.asStateFlow()
+
+    private val _authBusy = MutableStateFlow(false)
+    val authBusy: StateFlow<Boolean> = _authBusy.asStateFlow()
+
+    private val _authMessage = MutableStateFlow<String?>(null)
+    val authMessage: StateFlow<String?> = _authMessage.asStateFlow()
+
+    private val _tunnelState = MutableStateFlow<TunnelState>(TunnelState.Idle)
+    val tunnelState: StateFlow<TunnelState> = _tunnelState.asStateFlow()
+
+    private val _sharingCodeState = MutableStateFlow(SharingCodeState())
+    val sharingCodeState: StateFlow<SharingCodeState> = _sharingCodeState.asStateFlow()
+
+    private val _pendingRequests = MutableStateFlow<List<PendingJoinRequest>>(emptyList())
+    val pendingRequests: StateFlow<List<PendingJoinRequest>> = _pendingRequests.asStateFlow()
+
+    private val _connectedPeers = MutableStateFlow<List<ConnectedPeer>>(emptyList())
+    val connectedPeers: StateFlow<List<ConnectedPeer>> = _connectedPeers.asStateFlow()
+
+    private val _clientSelectedMode = MutableStateFlow(SharingMode.BROWSER_ONLY)
+    val clientSelectedMode: StateFlow<SharingMode> = _clientSelectedMode.asStateFlow()
+
+    private val _joinedHostInfo = MutableStateFlow<HostPublicInfo?>(null)
+    val joinedHostInfo: StateFlow<HostPublicInfo?> = _joinedHostInfo.asStateFlow()
+
+    private val _pendingVpnPermissionEvent = MutableStateFlow<Intent?>(null)
+    val pendingVpnPermissionEvent: StateFlow<Intent?> = _pendingVpnPermissionEvent.asStateFlow()
+
+    private val _diagnosticProbes = MutableStateFlow<List<DiagnosticProbeResult>>(emptyList())
+    val diagnosticProbes: StateFlow<List<DiagnosticProbeResult>> = _diagnosticProbes.asStateFlow()
+
+    private val _statusBannerMessage = MutableStateFlow<String?>(null)
+    val statusBannerMessage: StateFlow<String?> = _statusBannerMessage.asStateFlow()
+
+    // Active runtime objects (retained across UI backgrounding & configuration changes)
+    private var ephemeralKeyPair: KeyPair? = null
+    private var hostGatewayServer: DirectHostGatewayServer? = null
+    private var activeHostSessionDbId: Long = 0L
+    private var activeClientConnector: DirectClientConnector? = null
+    private var activeClientTransport: TunnelPeerTransport? = null
+    private var activeClientMux: LocalTunnelStreamMux? = null
+    private var clientConnectJob: Job? = null
+    private var clientReconnectJob: Job? = null
+    private var lastClientAttempt: ClientJoinAttempt? = null
+    @Volatile
+    private var manualClientDisconnect = false
+    @Volatile
+    private var trustedClientUuids: Set<String> = emptySet()
+
+    private val hostForwarders = ConcurrentHashMap<Long, HostGatewayForwarder>()
+    private var telemetryLoopJob: Job? = null
+    private var sessionStartedAtMs: Long = 0L
+
+    private data class ClientJoinAttempt(
+        val rawCodeOrQr: String,
+        val manualHostIp: String,
+        val manualHostPort: Int?,
+        val isOfflineRequest: Boolean = false,
+        val requestNote: String = ""
+    )
+
+    val downloadEngine = DownloadManagerEngine(
+        context = appContext,
+        repository = localRepo,
+        scope = runtimeScope,
+        tunnelClientProvider = { activeClientMux?.createTunnelOkHttpClient() }
+    )
+
+    init {
+        connectivityMonitor.start()
+        HostServiceBridge.onStopRequested = { stopHostSharing() }
+        HostServiceBridge.onApprovePeerRequested = { connId -> approvePeerById(connId, approve = true) }
+        HostServiceBridge.onRejectPeerRequested = { connId -> approvePeerById(connId, approve = false) }
+        ClientServiceBridge.onDisconnectRequested = { disconnectClient() }
+        VpnRuntimeBridge.onVpnStoppedExternally = {
+            if ((_tunnelState.value as? TunnelState.Connected)?.role == "CLIENT") {
+                logEvent("INFO", "VPN", "Whole-device VPN interface closed")
+            }
+        }
+        runtimeScope.launch {
+            refreshTrustedClientUuids()
+        }
+        runtimeScope.launch {
+            activeNetwork.collect { net ->
+                syncHostNetworkChanges(net)
+            }
+        }
+        startTelemetrySampler()
+    }
+
+    private suspend fun refreshTrustedClientUuids() {
+        trustedClientUuids = runCatching { localRepo.getTrustedClientUuids() }.getOrDefault(emptySet())
+    }
+
+    private fun loadStoredAuthSession(): AuthUserSession {
+        val token = credentialStore.getAuthToken()
+        val uuid = credentialStore.getOrCreateDeviceUuid()
+        return if (!token.isNullOrBlank() && credentialStore.getUserId() > 0L) {
+            AuthUserSession(
+                isSignedIn = true,
+                userId = credentialStore.getUserId(),
+                email = credentialStore.getUserEmail().orEmpty(),
+                displayName = credentialStore.getDisplayName().orEmpty(),
+                deviceUuid = uuid
+            )
+        } else {
+            AuthUserSession(isSignedIn = false, deviceUuid = uuid)
+        }
+    }
+
+    fun clearAuthMessage() {
+        _authMessage.value = null
+    }
+
+    fun clearStatusBanner() {
+        _statusBannerMessage.value = null
+    }
+
+    fun completeOnboarding() {
+        runtimeScope.launch { settingsStore.setOnboardingCompleted(true) }
+    }
+
+    // =========================================================================
+    // IN-APP LOCAL AUTHENTICATION (ROOM + KEYSTORE)
+    // =========================================================================
+
+    fun login(email: String, password: String) {
+        val cleanEmail = email.trim().lowercase(Locale.US)
+        if (cleanEmail.isBlank() || !cleanEmail.contains("@") || password.length < 6) {
+            _authMessage.value = "Enter a valid email and a password of at least 6 characters."
+            return
+        }
+        runtimeScope.launch {
+            _authBusy.value = true
+            _authMessage.value = null
+            try {
+                val account = localRepo.findAccountByEmail(cleanEmail)
+                if (account == null || !LocalPasswordHasher.verifyPassword(password, account.passwordSaltHex, account.passwordHashHex)) {
+                    _authMessage.value = "Invalid email or password for local account on this device."
+                    return@launch
+                }
+                localRepo.touchAccountLogin(account.id)
+                credentialStore.saveAuthToken("local-${UUID.randomUUID()}")
+                credentialStore.saveUserProfile(account.id, account.email, account.displayName)
+                _authSession.value = loadStoredAuthSession()
+                logEvent("INFO", "Auth", "Signed in locally as ${account.email}")
+            } catch (e: Exception) {
+                Log.e(TAG, "Local login failed", e)
+                _authMessage.value = "Failed to unlock local profile: ${e.localizedMessage}"
+            } finally {
+                _authBusy.value = false
+            }
+        }
+    }
+
+    fun register(displayName: String, email: String, password: String) {
+        val cleanName = displayName.trim()
+        val cleanEmail = email.trim().lowercase(Locale.US)
+        if (cleanName.isBlank() || !cleanEmail.contains("@") || password.length < 8) {
+            _authMessage.value = "Provide display name, valid email, and a password of at least 8 characters."
+            return
+        }
+        runtimeScope.launch {
+            _authBusy.value = true
+            _authMessage.value = null
+            try {
+                if (localRepo.findAccountByEmail(cleanEmail) != null) {
+                    _authMessage.value = "An account with $cleanEmail is already saved on this device. Please sign in."
+                    return@launch
+                }
+                val hashed = LocalPasswordHasher.hashPassword(password)
+                val id = localRepo.createLocalAccount(
+                    LocalAccountEntity(
+                        email = cleanEmail,
+                        displayName = cleanName,
+                        passwordSaltHex = hashed.saltHex,
+                        passwordHashHex = hashed.hashHex
+                    )
+                )
+                credentialStore.saveAuthToken("local-${UUID.randomUUID()}")
+                credentialStore.saveUserProfile(id, cleanEmail, cleanName)
+                _authSession.value = loadStoredAuthSession()
+                logEvent("INFO", "Auth", "Created local account $cleanEmail saved in app database")
+            } catch (e: Exception) {
+                Log.e(TAG, "Local registration failed", e)
+                _authMessage.value = "Could not save local account: ${e.localizedMessage}"
+            } finally {
+                _authBusy.value = false
+            }
+        }
+    }
+
+    fun signOut() {
+        stopHostSharing()
+        disconnectClient()
+        credentialStore.clearSession()
+        _authSession.value = loadStoredAuthSession()
+        logEvent("INFO", "Auth", "Signed out and cleared local session token")
+    }
+
+    // =========================================================================
+    // HOST MODE (BACKGROUND + OFFLINE ACCEPTANCE READY)
+    // =========================================================================
+
+    fun startHostSharing() {
+        if (!_authSession.value.isSignedIn) {
+            _statusBannerMessage.value = "Sign in to your local WiFiShare profile first."
+            return
+        }
+
+        runtimeScope.launch {
+            connectivityMonitor.refresh()
+            refreshTrustedClientUuids()
+            val net = activeNetwork.value
+            val p2p = wifiDirectManager.state.value
+
+            _tunnelState.value = TunnelState.Handshaking(
+                if (net.isConnected) "Starting background Host gateway & STUN check..."
+                else "Starting Host gateway in Offline Local Accept mode..."
+            )
+
+            val cfg = settings.value
+            val kp = TunnelCrypto.generateEphemeralKeyPair().also { ephemeralKeyPair = it }
+            val hostPubB64 = TunnelCrypto.encodePublicKey(kp.public)
+            val sharingCode = generateSharingCode()
+            val expiresAtSec = (System.currentTimeMillis() / 1000L) + (cfg.sessionExpiryMinutes * 60L)
+
+            val stunResult = if (net.isConnected) {
+                StunClient.discoverPublicEndpoint(cfg.stunHost, cfg.stunPort)
+            } else {
+                null
+            }
+            val stunEndpoint = stunResult?.getOrNull()?.let { "${it.publicIp}:${it.publicPort}" }
+                ?: if (net.hasLocalLink || p2p.isGroupActive) "Offline LAN / Direct P2P" else "Offline Standby"
+
+            val permittedProvider: () -> Set<SharingMode> = {
+                val cur = settings.value
+                buildSet {
+                    if (cur.allowBrowserMode) add(SharingMode.BROWSER_ONLY)
+                    if (cur.allowDownloadsMode) add(SharingMode.BROWSER_AND_DOWNLOADS)
+                    if (cur.allowVpnMode) add(SharingMode.WHOLE_DEVICE_VPN)
+                }.ifEmpty { setOf(SharingMode.BROWSER_ONLY) }
+            }
+
+            val hostName = _authSession.value.displayName.ifBlank { "${Build.MANUFACTURER} ${Build.MODEL}" }
+
+            val server = DirectHostGatewayServer(
+                sharingCode = sharingCode,
+                hostDisplayName = hostName,
+                networkType = if (net.isConnected) net.transport.name else "OFFLINE_LOCAL",
+                hostPublicKeyB64 = hostPubB64,
+                stunEndpoint = stunEndpoint,
+                permittedModesProvider = permittedProvider,
+                maxDevicesProvider = { settings.value.maxConnectedDevices },
+                activeDevicesCountProvider = { _connectedPeers.value.size },
+                expiresAtEpochSec = expiresAtSec,
+                scope = runtimeScope,
+                onJoinRequested = { req ->
+                    _pendingRequests.value = _pendingRequests.value.filterNot { it.connectionId == req.connectionId } + req
+                    HostServiceBridge.pendingCount = _pendingRequests.value.size
+                    HostServiceBridge.notifyIncomingRequest(appContext, req)
+                    logEvent("INFO", "Host", "Incoming join request from ${req.clientName} (${req.requestedMode.label})")
+                },
+                onPendingClosed = { connId ->
+                    _pendingRequests.value = _pendingRequests.value.filterNot { it.connectionId == connId }
+                    HostServiceBridge.pendingCount = _pendingRequests.value.size
+                    HostServiceBridge.dismissRequestNotification(appContext, connId)
+                },
+                onServerError = { err ->
+                    logEvent("ERROR", "Host", "Gateway socket error: ${err.message}")
+                },
+                autoAcceptTrustedProvider = { settings.value.autoAcceptTrustedPeers },
+                trustedDeviceUuidsProvider = { trustedClientUuids },
+                onAutoApproveRequested = { req ->
+                    logEvent("INFO", "Host", "Auto-accepting trusted offline peer ${req.clientName}")
+                    approvePeerRequest(req, approve = true, markTrusted = true)
+                },
+                networkTypeProvider = {
+                    val cur = activeNetwork.value
+                    if (cur.isConnected) cur.transport.name else "OFFLINE_LOCAL"
+                },
+                allowOpenOfflineRequestsProvider = { settings.value.allowOpenOfflineRequests }
+            )
+
+            val portRes = server.start(cfg.directListenPort)
+            if (portRes.isFailure) {
+                val err = portRes.exceptionOrNull()?.localizedMessage ?: "Port bind failed"
+                _tunnelState.value = TunnelState.Error(
+                    "HOST_BIND_FAILED",
+                    "Could not open local Host gateway port: $err",
+                    "Try changing the Direct Gateway Listen Port in Settings."
+                )
+                return@launch
+            }
+
+            val listenPort = portRes.getOrThrow()
+            hostGatewayServer = server
+            val advertiseIp = net.localIp.takeIf { it != "—" && it.isNotBlank() }
+                ?: p2p.groupOwnerIp.takeIf { it.isNotBlank() }
+                ?: stunResult?.getOrNull()?.publicIp
+                ?: "127.0.0.1"
+            val inviteUri = QrCodeGenerator.buildInviteUri(
+                code = sharingCode,
+                hostIp = advertiseIp,
+                port = listenPort,
+                hostPublicKeyB64 = hostPubB64
+            )
+
+            val dbSessionId = localRepo.recordHostSessionStart(
+                SavedHostSessionEntity(
+                    sharingCode = sharingCode,
+                    listenPort = listenPort,
+                    localIp = advertiseIp,
+                    stunEndpoint = stunEndpoint,
+                    permittedModesCsv = permittedProvider().joinToString(",") { it.code },
+                    maxDevices = cfg.maxConnectedDevices
+                )
+            )
+            activeHostSessionDbId = dbSessionId
+
+            if (cfg.enableNsdDiscovery) {
+                nsdDiscovery.registerHostService(
+                    sharingCode = sharingCode,
+                    hostName = hostName,
+                    port = listenPort,
+                    networkType = if (net.isConnected) net.transport.name else "OFFLINE",
+                    hostPublicKeyB64 = hostPubB64,
+                    permittedModes = permittedProvider()
+                )
+            }
+            beaconDiscovery.startAdvertising(
+                sharingCode = sharingCode,
+                hostName = hostName,
+                port = listenPort,
+                networkTypeProvider = {
+                    val cur = activeNetwork.value
+                    if (cur.isConnected) cur.transport.name else "OFFLINE"
+                },
+                hostPublicKeyB64 = hostPubB64,
+                permittedModesProvider = permittedProvider
+            )
+            val seenOfflineNeedIds = ConcurrentHashMap.newKeySet<String>()
+            beaconDiscovery.startListeningForOfflineNeeds { need, senderAddr ->
+                val curNet = activeNetwork.value
+                beaconDiscovery.sendDirectHostReply(
+                    targetAddress = senderAddr,
+                    sharingCode = sharingCode,
+                    hostName = hostName,
+                    port = listenPort,
+                    networkType = if (curNet.isConnected) curNet.transport.name else "OFFLINE",
+                    hostPublicKeyB64 = hostPubB64,
+                    permittedModes = permittedProvider()
+                )
+                if (seenOfflineNeedIds.add(need.deviceUuid)) {
+                    logEvent(
+                        "INFO",
+                        "Host",
+                        "Nearby offline internet request from ${need.deviceName} (${need.senderIp}): ${need.note.ifBlank { need.requestedMode.label }}"
+                    )
+                }
+            }
+
+            _sharingCodeState.value = SharingCodeState(
+                sessionId = dbSessionId,
+                code = sharingCode,
+                qrPayload = inviteUri,
+                inviteUri = inviteUri,
+                expiresAtEpochSec = expiresAtSec,
+                hostPublicKeyB64 = hostPubB64,
+                listenHost = advertiseIp,
+                listenPort = listenPort,
+                stunEndpoint = stunEndpoint,
+                permittedModes = permittedProvider()
+            )
+
+            sessionStartedAtMs = System.currentTimeMillis()
+            trafficAccounting.reset()
+            HostServiceBridge.activeCode = sharingCode
+            HostServiceBridge.connectedCount = 0
+            HostServiceBridge.pendingCount = 0
+            HostServiceBridge.egressStatusLabel = if (net.isConnected) net.transport.name else "Offline Local"
+            startHostForegroundService()
+
+            _tunnelState.value = TunnelState.Connected(
+                role = "HOST",
+                mode = SharingMode.WHOLE_DEVICE_VPN,
+                transportPath = "Direct P2P ($advertiseIp:$listenPort)",
+                peerLabel = if (net.isConnected) "Background (${net.transport.name})" else "Offline Accept Ready",
+                assignedVirtualIp = "10.88.0.1",
+                startedAtMs = sessionStartedAtMs
+            )
+            logEvent(
+                "INFO",
+                "Host",
+                if (net.isConnected) {
+                    "Started background Host session $sharingCode on $advertiseIp:$listenPort"
+                } else {
+                    "Started offline Host session $sharingCode on $advertiseIp:$listenPort (ready to accept local/offline connections)"
+                }
+            )
+        }
+    }
+
+    private fun syncHostNetworkChanges(net: ActiveNetworkInfo) {
+        val currentTunnel = _tunnelState.value as? TunnelState.Connected ?: return
+        if (currentTunnel.role != "HOST") return
+
+        HostServiceBridge.egressStatusLabel = if (net.isConnected) net.transport.name else "Offline Local"
+        val curCode = _sharingCodeState.value
+        val p2pIp = wifiDirectManager.state.value.groupOwnerIp.takeIf { it.isNotBlank() }
+        val updatedIp = net.localIp.takeIf { it != "—" && it.isNotBlank() } ?: p2pIp
+
+        if (curCode.code.isNotBlank() && updatedIp != null && curCode.listenHost == "127.0.0.1") {
+            val invite = QrCodeGenerator.buildInviteUri(
+                code = curCode.code,
+                hostIp = updatedIp,
+                port = curCode.listenPort,
+                hostPublicKeyB64 = curCode.hostPublicKeyB64
+            )
+            _sharingCodeState.value = curCode.copy(
+                listenHost = updatedIp,
+                inviteUri = invite,
+                qrPayload = invite
+            )
+            _tunnelState.value = currentTunnel.copy(
+                transportPath = "Direct P2P ($updatedIp:${curCode.listenPort})",
+                peerLabel = if (net.isConnected) "Background (${net.transport.name})" else "Offline Accept Ready"
+            )
+        } else {
+            _tunnelState.value = currentTunnel.copy(
+                peerLabel = if (net.isConnected) "Background (${net.transport.name})" else "Offline Accept Ready"
+            )
+        }
+    }
+
+    private fun onWifiDirectGroupUpdated(isOwner: Boolean, ownerIp: String) {
+        if (ownerIp.isBlank()) return
+        connectivityMonitor.refresh()
+        if (isOwner) {
+            val curCode = _sharingCodeState.value
+            val currentTunnel = _tunnelState.value as? TunnelState.Connected
+            if (currentTunnel?.role == "HOST" && curCode.code.isNotBlank() &&
+                (curCode.listenHost == "127.0.0.1" || curCode.listenHost.isBlank())
+            ) {
+                val invite = QrCodeGenerator.buildInviteUri(
+                    code = curCode.code,
+                    hostIp = ownerIp,
+                    port = curCode.listenPort,
+                    hostPublicKeyB64 = curCode.hostPublicKeyB64
+                )
+                _sharingCodeState.value = curCode.copy(
+                    listenHost = ownerIp,
+                    inviteUri = invite,
+                    qrPayload = invite,
+                    stunEndpoint = "Offline Wi-Fi Direct ($ownerIp)"
+                )
+                _tunnelState.value = currentTunnel.copy(
+                    transportPath = "Wi-Fi Direct ($ownerIp:${curCode.listenPort})"
+                )
+            }
+            logEvent("INFO", "WiFiDirect", "Offline Wi-Fi Direct Group Owner active at $ownerIp")
+        } else {
+            logEvent("INFO", "WiFiDirect", "Connected offline to Wi-Fi Direct Group Owner at $ownerIp")
+            _statusBannerMessage.value = "Offline Wi-Fi Direct linked to Host ($ownerIp)"
+        }
+    }
+
+    fun startHostOfflineWifiDirectGroup() {
+        wifiDirectManager.createOfflineGroup().onFailure { err ->
+            _statusBannerMessage.value = err.message ?: "Could not start Wi-Fi Direct group."
+        }
+    }
+
+    fun scanOfflineWifiDirectPeers() {
+        nsdDiscovery.startDiscovery()
+        beaconDiscovery.startListening()
+        wifiDirectManager.startPeerDiscovery().onFailure { err ->
+            _statusBannerMessage.value = err.message ?: "Wi-Fi Direct unavailable; scanning LAN beacons instead."
+        }
+    }
+
+    fun connectOfflineWifiDirectPeer(deviceAddress: String) {
+        wifiDirectManager.connectToPeer(deviceAddress).onFailure { err ->
+            _statusBannerMessage.value = err.message ?: "Could not connect to Wi-Fi Direct peer."
+        }
+    }
+
+    fun stopOfflineWifiDirect() {
+        wifiDirectManager.stopAll()
+    }
+
+    fun regenerateSharingCode() {
+        stopHostSharing()
+        startHostSharing()
+    }
+
+    fun revokeSharingCodeAndStop() {
+        stopHostSharing()
+    }
+
+    fun approvePeerById(connectionId: Long, approve: Boolean, markTrusted: Boolean = false) {
+        val req = _pendingRequests.value.firstOrNull { it.connectionId == connectionId } ?: return
+        approvePeerRequest(req, approve, markTrusted)
+    }
+
+    fun approvePeerRequest(
+        request: PendingJoinRequest,
+        approve: Boolean,
+        markTrusted: Boolean = false
+    ) {
+        val server = hostGatewayServer ?: return
+        val sessionState = _sharingCodeState.value
+        val kp = ephemeralKeyPair ?: return
+
+        HostServiceBridge.dismissRequestNotification(appContext, request.connectionId)
+
+        runtimeScope.launch {
+            _pendingRequests.value = _pendingRequests.value.filterNot { it.connectionId == request.connectionId }
+            HostServiceBridge.pendingCount = _pendingRequests.value.size
+
+            if (!approve) {
+                server.rejectPendingClient(request.connectionId, "Host declined your connection request.")
+                localRepo.savePeerRecord(
+                    SavedPeerEntity(
+                        role = "CLIENT",
+                        deviceUuid = request.clientDeviceId,
+                        peerName = request.clientName,
+                        hostIp = request.clientEndpoint,
+                        hostPort = sessionState.listenPort,
+                        sharingCode = sessionState.code,
+                        modeCode = request.requestedMode.code,
+                        approvalStatus = "REJECTED"
+                    )
+                )
+                refreshTrustedClientUuids()
+                logEvent("INFO", "Host", "Rejected connection from ${request.clientName}")
+                return@launch
+            }
+
+            val nextSuffix = (_connectedPeers.value.size + 2).coerceAtMost(254)
+            val assignedIp = "10.88.0.$nextSuffix"
+            val cipher = TunnelCrypto.deriveSessionCipher(
+                localKeyPair = kp,
+                remotePublicKeyB64 = request.clientPublicKeyB64,
+                sessionSalt = sessionState.code.toByteArray(Charsets.UTF_8),
+                isHost = true
+            )
+
+            var forwarderRef: HostGatewayForwarder? = null
+            val transportRes = server.approvePendingClient(
+                connectionId = request.connectionId,
+                assignedIp = assignedIp,
+                cipher = cipher,
+                accounting = trafficAccounting,
+                onFrameReceived = { frame -> forwarderRef?.handleIncomingFrame(frame) },
+                onTransportError = { err ->
+                    logEvent("WARN", "HostTunnel", "Peer ${request.clientName} disconnected: ${err.message}")
+                    hostForwarders.remove(request.connectionId)?.close()
+                    _connectedPeers.value = _connectedPeers.value.filterNot { it.connectionId == request.connectionId }
+                    HostServiceBridge.connectedCount = _connectedPeers.value.size
+                }
+            )
+
+            val transport = transportRes.getOrNull()
+            if (transport == null) {
+                _statusBannerMessage.value = transportRes.exceptionOrNull()?.localizedMessage
+                    ?: "Client disconnected before approval completed."
+                return@launch
+            }
+
+            val forwarder = HostGatewayForwarder(
+                clientLabel = request.clientName,
+                cipher = cipher,
+                transport = transport,
+                accounting = trafficAccounting,
+                activeNetworkProvider = { connectivityMonitor.getActivePhysicalNetwork() },
+                scope = runtimeScope,
+                onClientDisconnected = {
+                    hostForwarders.remove(request.connectionId)
+                    _connectedPeers.value = _connectedPeers.value.filterNot { it.connectionId == request.connectionId }
+                    HostServiceBridge.connectedCount = _connectedPeers.value.size
+                }
+            )
+            forwarderRef = forwarder
+            hostForwarders[request.connectionId] = forwarder
+
+            val peer = ConnectedPeer(
+                connectionId = request.connectionId,
+                clientDeviceId = request.clientDeviceId,
+                deviceName = request.clientName,
+                virtualIp = assignedIp,
+                mode = request.requestedMode,
+                transportPath = transport.transportLabel,
+                connectedAtMs = System.currentTimeMillis(),
+                bytesUploaded = 0L,
+                bytesDownloaded = 0L,
+                uploadBps = 0L,
+                downloadBps = 0L
+            )
+            _connectedPeers.value = _connectedPeers.value.filterNot { it.connectionId == request.connectionId } + peer
+            HostServiceBridge.connectedCount = _connectedPeers.value.size
+
+            val approvalState = if (markTrusted) "TRUSTED" else "APPROVED"
+            localRepo.savePeerRecord(
+                SavedPeerEntity(
+                    role = "CLIENT",
+                    deviceUuid = request.clientDeviceId,
+                    peerName = request.clientName,
+                    hostIp = request.clientEndpoint,
+                    hostPort = sessionState.listenPort,
+                    sharingCode = sessionState.code,
+                    modeCode = request.requestedMode.code,
+                    approvalStatus = approvalState
+                )
+            )
+            refreshTrustedClientUuids()
+            logEvent("INFO", "Host", "Accepted ${request.clientName} ($assignedIp) [$approvalState]")
+        }
+    }
+
+    fun setSavedPeerTrusted(peer: SavedPeerEntity, trusted: Boolean) {
+        runtimeScope.launch {
+            localRepo.updatePeerApprovalStatus(peer.id, if (trusted) "TRUSTED" else "APPROVED")
+            refreshTrustedClientUuids()
+        }
+    }
+
+    fun removeSavedPeer(peerId: Long) {
+        runtimeScope.launch {
+            localRepo.deletePeerRecord(peerId)
+            refreshTrustedClientUuids()
+        }
+    }
+
+    fun disconnectPeer(connectionId: Long) {
+        runtimeScope.launch {
+            hostForwarders.remove(connectionId)?.close()
+            _connectedPeers.value = _connectedPeers.value.filterNot { it.connectionId == connectionId }
+            HostServiceBridge.connectedCount = _connectedPeers.value.size
+            logEvent("INFO", "Host", "Disconnected peer #$connectionId")
+        }
+    }
+
+    fun stopHostSharing() {
+        nsdDiscovery.unregisterHostService()
+        beaconDiscovery.stopAdvertising()
+        beaconDiscovery.stopListeningForOfflineNeeds()
+        hostGatewayServer?.stop()
+        hostGatewayServer = null
+
+        val snap = trafficAccounting.snapshot.value
+        val dur = if (sessionStartedAtMs > 0L) (System.currentTimeMillis() - sessionStartedAtMs) / 1000L else 0L
+        val sessionDbId = activeHostSessionDbId
+        activeHostSessionDbId = 0L
+
+        _pendingRequests.value.forEach { req ->
+            HostServiceBridge.dismissRequestNotification(appContext, req.connectionId)
+        }
+        hostForwarders.values.forEach { it.close() }
+        hostForwarders.clear()
+        _pendingRequests.value = emptyList()
+        _connectedPeers.value = emptyList()
+        HostServiceBridge.connectedCount = 0
+        HostServiceBridge.pendingCount = 0
+        _sharingCodeState.value = SharingCodeState()
+
+        runtimeScope.launch {
+            localRepo.markHostSessionEnded(sessionDbId)
+            localRepo.recordSessionTraffic("HOST", "Direct P2P Gateway", snap.totalUploadedBytes, snap.totalDownloadedBytes, dur)
+        }
+
+        val stopIntent = Intent(appContext, HostSharingService::class.java).apply {
+            action = HostSharingService.ACTION_STOP
+        }
+        runCatching { appContext.startService(stopIntent) }
+        if ((_tunnelState.value as? TunnelState.Connected)?.role == "HOST" ||
+            _tunnelState.value is TunnelState.Handshaking
+        ) {
+            _tunnelState.value = TunnelState.Idle
+        }
+        logEvent("INFO", "Host", "Stopped Host sharing session")
+    }
+
+    // =========================================================================
+    // CLIENT MODE (BACKGROUND SERVICE + OFFLINE LAN / WI-FI DIRECT + RECONNECT)
+    // =========================================================================
+
+    fun startNearbyHostScan() {
+        nsdDiscovery.startDiscovery()
+        beaconDiscovery.startListening()
+    }
+
+    fun stopNearbyHostScan() {
+        nsdDiscovery.stopDiscovery()
+        beaconDiscovery.stopListening()
+    }
+
+    fun selectClientMode(mode: SharingMode) {
+        _clientSelectedMode.value = mode
+    }
+
+    fun requestClientJoin(
+        rawCodeOrQr: String,
+        manualHostIp: String = "",
+        manualHostPort: Int? = null
+    ) {
+        val parsedInvite = QrCodeGenerator.parseShareInvite(rawCodeOrQr)
+        val code = parsedInvite?.code ?: rawCodeOrQr.trim().uppercase()
+        if (code.length < 6) {
+            _tunnelState.value = TunnelState.Error(
+                "INVALID_SHARING_CODE",
+                "The sharing code \"$rawCodeOrQr\" is invalid.",
+                "Enter the full code shown on the Host device or scan its QR code."
+            )
+            return
+        }
+        if (!_authSession.value.isSignedIn) {
+            _statusBannerMessage.value = "Sign in to your local WiFiShare profile before connecting."
+            return
+        }
+
+        manualClientDisconnect = false
+        lastClientAttempt = ClientJoinAttempt(rawCodeOrQr, manualHostIp, manualHostPort, isOfflineRequest = false)
+        clientReconnectJob?.cancel()
+        clientConnectJob?.cancel()
+        activeClientConnector?.cancel()
+        beaconDiscovery.stopBroadcastingOfflineNeed()
+
+        ClientServiceBridge.statusTitle = "Resolving Host ($code)..."
+        ClientServiceBridge.peerLabel = code
+        ClientServiceBridge.modeLabel = _clientSelectedMode.value.label
+        startClientForegroundService()
+
+        clientConnectJob = runtimeScope.launch {
+            _tunnelState.value = TunnelState.Handshaking("Resolving Host endpoint (LAN / Offline P2P)...")
+
+            var targetIp = parsedInvite?.hostIp ?: manualHostIp.trim().takeIf { it.isNotBlank() }
+            var targetPort = parsedInvite?.hostPort ?: manualHostPort
+
+            if (targetIp == null || targetPort == null) {
+                val match = discoveredHosts.value.firstOrNull { it.sharingCode.equals(code, ignoreCase = true) }
+                if (match != null) {
+                    targetIp = match.hostIp
+                    targetPort = match.hostPort
+                } else {
+                    if (settings.value.enableNsdDiscovery && !isNsdScanning.value) {
+                        nsdDiscovery.startDiscovery()
+                    }
+                    beaconDiscovery.startListening()
+                    repeat(14) {
+                        delay(250)
+                        val found = discoveredHosts.value.firstOrNull { it.sharingCode.equals(code, ignoreCase = true) }
+                        if (found != null) {
+                            targetIp = found.hostIp
+                            targetPort = found.hostPort
+                            return@repeat
+                        }
+                    }
+                }
+            }
+
+            if (targetIp == null) {
+                val p2pOwnerIp = wifiDirectManager.state.value.groupOwnerIp.takeIf { it.isNotBlank() }
+                if (p2pOwnerIp != null) {
+                    targetIp = p2pOwnerIp
+                }
+            }
+
+            if (targetIp == null || targetPort == null) {
+                val saved = localRepo.getTrustedOrRecentHostByCode(code)
+                if (saved != null && saved.hostIp.isNotBlank() && saved.hostPort > 0) {
+                    targetIp = saved.hostIp
+                    targetPort = saved.hostPort
+                }
+            }
+
+            val resolvedIp = targetIp
+            val resolvedPort = targetPort ?: settings.value.directListenPort
+            if (resolvedIp.isNullOrBlank()) {
+                stopClientForegroundService()
+                _tunnelState.value = TunnelState.Error(
+                    "HOST_ENDPOINT_NEEDED",
+                    "No Host IP address found for code $code.",
+                    "Scan the Host's QR code, connect via Hotspot/Wi-Fi Direct, or enter the Host IP & Port."
+                )
+                return@launch
+            }
+
+            connectClientToEndpoint(
+                resolvedIp = resolvedIp,
+                resolvedPort = resolvedPort,
+                code = code,
+                isOfflineRequest = false,
+                requestNote = ""
+            )
+        }
+    }
+
+    /**
+     * Allows an offline Client with no sharing code to broadcast an offline internet request beacon,
+     * discover any nearby Host (via UDP Beacon, mDNS, Wi-Fi Direct, manual IP, or reachable saved Host),
+     * and submit an open join request directly to that Host for authorization.
+     */
+    fun requestInternetOffline(
+        note: String = "",
+        manualHostIp: String = "",
+        manualHostPort: Int? = null
+    ) {
+        if (!_authSession.value.isSignedIn) {
+            _statusBannerMessage.value = "Sign in to your local WiFiShare profile before requesting internet."
+            return
+        }
+
+        val cleanNote = note.trim().take(120)
+        val deviceUuid = credentialStore.getOrCreateDeviceUuid()
+        val deviceName = _authSession.value.displayName.ifBlank { "${Build.MANUFACTURER} ${Build.MODEL}" }
+
+        manualClientDisconnect = false
+        lastClientAttempt = ClientJoinAttempt(
+            rawCodeOrQr = "",
+            manualHostIp = manualHostIp,
+            manualHostPort = manualHostPort,
+            isOfflineRequest = true,
+            requestNote = cleanNote
+        )
+        clientReconnectJob?.cancel()
+        clientConnectJob?.cancel()
+        activeClientConnector?.cancel()
+        beaconDiscovery.stopBroadcastingOfflineNeed()
+
+        ClientServiceBridge.statusTitle = "Requesting Internet Offline..."
+        ClientServiceBridge.peerLabel = "Nearby Host"
+        ClientServiceBridge.modeLabel = _clientSelectedMode.value.label
+        startClientForegroundService()
+
+        clientConnectJob = runtimeScope.launch {
+            _tunnelState.value = TunnelState.Handshaking("Broadcasting offline internet request & listening for nearby Hosts...")
+
+            if (settings.value.enableNsdDiscovery && !isNsdScanning.value) {
+                nsdDiscovery.startDiscovery()
+            }
+            beaconDiscovery.startListening()
+            beaconDiscovery.startBroadcastingOfflineNeed(
+                deviceUuid = deviceUuid,
+                deviceName = deviceName,
+                requestedMode = _clientSelectedMode.value,
+                note = cleanNote
+            )
+
+            logEvent("INFO", "Client", "Started offline internet request broadcast (${cleanNote.ifBlank { _clientSelectedMode.value.label }})")
+
+            var targetIp: String? = null
+            var targetPort: Int? = null
+            var targetCode: String = DirectHostGatewayServer.OFFLINE_REQUEST_CODE
+
+            val savedList = localRepo.savedHosts.firstOrNull().orEmpty()
+                .filter { it.hostIp.isNotBlank() && it.hostPort > 0 }
+
+            for (attempt in 0 until 120) {
+                if (!isActive || manualClientDisconnect) {
+                    beaconDiscovery.stopBroadcastingOfflineNeed()
+                    return@launch
+                }
+
+                val discovered = discoveredHosts.value.firstOrNull()
+                if (discovered != null) {
+                    targetIp = discovered.hostIp
+                    targetPort = discovered.hostPort
+                    targetCode = discovered.sharingCode.ifBlank { DirectHostGatewayServer.OFFLINE_REQUEST_CODE }
+                    break
+                }
+
+                val manualClean = manualHostIp.trim()
+                if (manualClean.isNotBlank()) {
+                    targetIp = manualClean
+                    targetPort = manualHostPort ?: settings.value.directListenPort
+                    targetCode = DirectHostGatewayServer.OFFLINE_REQUEST_CODE
+                    break
+                }
+
+                val p2pIp = wifiDirectManager.state.value.groupOwnerIp.takeIf { it.isNotBlank() }
+                if (p2pIp != null && attempt >= 1) {
+                    targetIp = p2pIp
+                    targetPort = manualHostPort ?: settings.value.directListenPort
+                    targetCode = DirectHostGatewayServer.OFFLINE_REQUEST_CODE
+                    break
+                }
+
+                // Every 4 cycles (~6s), check if any previously paired Host is reachable on TCP
+                if (attempt % 4 == 2 && savedList.isNotEmpty()) {
+                    val reachableSaved = savedList.firstOrNull { saved ->
+                        runCatching {
+                            java.net.Socket().use { s ->
+                                s.connect(InetSocketAddress(saved.hostIp, saved.hostPort), 500)
+                                true
+                            }
+                        }.getOrDefault(false)
+                    }
+                    if (reachableSaved != null) {
+                        targetIp = reachableSaved.hostIp
+                        targetPort = reachableSaved.hostPort
+                        targetCode = reachableSaved.sharingCode.ifBlank { DirectHostGatewayServer.OFFLINE_REQUEST_CODE }
+                        break
+                    }
+                }
+
+                delay(1500)
+            }
+
+            beaconDiscovery.stopBroadcastingOfflineNeed()
+
+            val resolvedIp = targetIp
+            val resolvedPort = targetPort ?: settings.value.directListenPort
+            if (resolvedIp.isNullOrBlank()) {
+                stopClientForegroundService()
+                _tunnelState.value = TunnelState.Error(
+                    "NO_OFFLINE_HOST_FOUND",
+                    "No nearby WiFiShare Host responded to your offline request.",
+                    "Ensure a nearby Host has Start Sharing enabled on the same Wi-Fi, Hotspot, or Wi-Fi Direct group."
+                )
+                return@launch
+            }
+
+            connectClientToEndpoint(
+                resolvedIp = resolvedIp,
+                resolvedPort = resolvedPort,
+                code = targetCode,
+                isOfflineRequest = true,
+                requestNote = cleanNote
+            )
+        }
+    }
+
+    private suspend fun connectClientToEndpoint(
+        resolvedIp: String,
+        resolvedPort: Int,
+        code: String,
+        isOfflineRequest: Boolean,
+        requestNote: String
+    ) {
+        ClientServiceBridge.statusTitle = "Connecting to $resolvedIp:$resolvedPort..."
+        _tunnelState.value = TunnelState.Handshaking(
+            if (isOfflineRequest) "Found nearby Host $resolvedIp:$resolvedPort · sending offline request..."
+            else "Connecting directly to Host $resolvedIp:$resolvedPort..."
+        )
+
+        val cfg = settings.value
+        val kp = TunnelCrypto.generateEphemeralKeyPair().also { ephemeralKeyPair = it }
+        val clientPubB64 = TunnelCrypto.encodePublicKey(kp.public)
+        val net = activeNetwork.value
+        val stunEndpoint = if (net.isConnected) {
+            StunClient.discoverPublicEndpoint(cfg.stunHost, cfg.stunPort)
+                .getOrNull()?.let { "${it.publicIp}:${it.publicPort}" } ?: "direct"
+        } else {
+            "offline-local"
+        }
+
+        val connector = DirectClientConnector(
+            hostIp = resolvedIp,
+            hostPort = resolvedPort,
+            sharingCode = code,
+            deviceUuid = credentialStore.getOrCreateDeviceUuid(),
+            deviceName = _authSession.value.displayName.ifBlank { "${Build.MANUFACTURER} ${Build.MODEL}" },
+            clientPublicKeyB64 = clientPubB64,
+            requestedMode = _clientSelectedMode.value,
+            stunEndpoint = stunEndpoint,
+            scope = runtimeScope,
+            isOfflineRequest = isOfflineRequest,
+            requestNote = requestNote
+        )
+        activeClientConnector = connector
+
+        connector.connectAndAwaitApproval(
+            onAwaitingApproval = { hostInfo ->
+                _joinedHostInfo.value = hostInfo
+                val displayCode = hostInfo.resolvedSharingCode.ifBlank { code }
+                ClientServiceBridge.peerLabel = hostInfo.hostDisplayName
+                ClientServiceBridge.statusTitle = "Awaiting Host Approval"
+                _tunnelState.value = TunnelState.AwaitingHostApproval(displayCode, hostInfo.hostDisplayName)
+                logEvent("INFO", "Client", "Requested access from ${hostInfo.hostDisplayName} ($resolvedIp:$resolvedPort)")
+            },
+            onRejected = { reason ->
+                stopClientForegroundService()
+                _tunnelState.value = TunnelState.Error(
+                    "HOST_REJECTED",
+                    reason,
+                    "Ask the Host to approve your device or verify the permitted modes and open-request setting."
+                )
+                logEvent("WARN", "Client", "Host rejected join: $reason")
+            },
+            onApproved = { hostInfo, assignedIp, createTransport ->
+                establishClientEncryptedTunnel(
+                    code = code,
+                    hostInfo = hostInfo,
+                    assignedIp = assignedIp,
+                    createTransport = createTransport
+                )
+            },
+            onError = { err ->
+                if (!manualClientDisconnect && settings.value.autoReconnect &&
+                    _tunnelState.value is TunnelState.Reconnecting
+                ) {
+                    scheduleClientReconnect(err.message ?: "Host unreachable")
+                } else {
+                    stopClientForegroundService()
+                    _tunnelState.value = TunnelState.Error(
+                        "DIRECT_CONNECT_FAILED",
+                        "Could not reach Host at $resolvedIp:$resolvedPort (${err.localizedMessage}).",
+                        "Ensure both devices share a Wi-Fi/Hotspot/Wi-Fi Direct link or reachable IP."
+                    )
+                    logEvent("ERROR", "Client", "Direct connect failed: ${err.message}")
+                }
+            }
+        )
+    }
+
+    private suspend fun establishClientEncryptedTunnel(
+        code: String,
+        hostInfo: HostPublicInfo,
+        assignedIp: String,
+        createTransport: (
+            cipher: com.example.networking.crypto.TunnelSessionCipher,
+            accounting: TrafficAccounting,
+            onFrame: suspend (DecryptedTunnelFrame) -> Unit,
+            onError: (Throwable) -> Unit
+        ) -> DirectSocketTunnelTransport
+    ) {
+        val kp = ephemeralKeyPair ?: return
+        val cfg = settings.value
+        beaconDiscovery.stopBroadcastingOfflineNeed()
+        val effectiveCode = hostInfo.resolvedSharingCode.ifBlank { code }
+        ClientServiceBridge.statusTitle = "Establishing Encrypted Tunnel"
+        _tunnelState.value = TunnelState.Handshaking("Establishing encrypted tunnel to ${hostInfo.hostDisplayName}...")
+
+        val cipher = TunnelCrypto.deriveSessionCipher(
+            localKeyPair = kp,
+            remotePublicKeyB64 = hostInfo.hostPublicKeyB64,
+            sessionSalt = effectiveCode.toByteArray(Charsets.UTF_8),
+            isHost = false
+        )
+
+        trafficAccounting.reset()
+        sessionStartedAtMs = System.currentTimeMillis()
+        var muxRef: LocalTunnelStreamMux? = null
+
+        val onFrame: suspend (DecryptedTunnelFrame) -> Unit = { frame ->
+            when (frame.type) {
+                TunnelCrypto.FRAME_IP_PACKET -> VpnRuntimeBridge.deliverDecryptedIpPacket(frame)
+                TunnelCrypto.FRAME_STREAM_DATA, TunnelCrypto.FRAME_STREAM_CLOSE -> muxRef?.onFrameReceived(frame)
+                TunnelCrypto.FRAME_PONG -> {
+                    TunnelWireCodec.decodePingTimestamp(frame.payload)?.let { sent ->
+                        trafficAccounting.updateLatency(System.currentTimeMillis() - sent)
+                    }
+                }
+                TunnelCrypto.FRAME_DISCONNECT -> {
+                    manualClientDisconnect = true
+                    disconnectClient()
+                    _tunnelState.value = TunnelState.Error(
+                        "HOST_STOPPED",
+                        "Host closed the encrypted tunnel.",
+                        "Reconnect when the Host is sharing again."
+                    )
+                }
+            }
+        }
+
+        val transport = createTransport(cipher, trafficAccounting, onFrame) { err ->
+            if (!manualClientDisconnect && settings.value.autoReconnect &&
+                (_tunnelState.value is TunnelState.Connected || _tunnelState.value is TunnelState.Reconnecting)
+            ) {
+                scheduleClientReconnect(err.message ?: "Tunnel interrupted")
+            } else if (!manualClientDisconnect) {
+                stopClientForegroundService()
+                _tunnelState.value = TunnelState.Error(
+                    "TUNNEL_LOST",
+                    "Encrypted tunnel disconnected: ${err.message}",
+                    "Reconnect to the Host when available."
+                )
+            }
+        }
+
+        activeClientTransport = transport
+        val mux = LocalTunnelStreamMux(cipher, transport, runtimeScope).also {
+            it.startLocalProxy()
+            muxRef = it
+            activeClientMux = it
+        }
+
+        VpnRuntimeBridge.activeCipher = cipher
+        VpnRuntimeBridge.activeTransport = transport
+        VpnRuntimeBridge.activeAccounting = trafficAccounting
+        VpnRuntimeBridge.assignedIp = assignedIp
+        VpnRuntimeBridge.mtu = cfg.vpnMtu
+        VpnRuntimeBridge.ipv6Enabled = cfg.ipv6Enabled
+        VpnRuntimeBridge.dnsLeakProtection = cfg.dnsLeakProtection
+
+        transport.sendEncrypted(cipher.seal(TunnelCrypto.FRAME_PING, 0, TunnelWireCodec.encodePingTimestamp()))
+
+        localRepo.savePeerRecord(
+            SavedPeerEntity(
+                role = "HOST",
+                deviceUuid = "${hostInfo.hostIp}:${hostInfo.hostPort}",
+                peerName = hostInfo.hostDisplayName,
+                hostIp = hostInfo.hostIp,
+                hostPort = hostInfo.hostPort,
+                sharingCode = effectiveCode,
+                hostPublicKeyB64 = hostInfo.hostPublicKeyB64,
+                modeCode = _clientSelectedMode.value.code,
+                approvalStatus = "APPROVED"
+            )
+        )
+
+        ClientServiceBridge.peerLabel = hostInfo.hostDisplayName
+        ClientServiceBridge.modeLabel = _clientSelectedMode.value.label
+        ClientServiceBridge.statusTitle = "Connected (Background)"
+
+        _tunnelState.value = TunnelState.Connected(
+            role = "CLIENT",
+            mode = _clientSelectedMode.value,
+            transportPath = transport.transportLabel,
+            peerLabel = hostInfo.hostDisplayName,
+            assignedVirtualIp = assignedIp,
+            startedAtMs = sessionStartedAtMs
+        )
+        logEvent("INFO", "ClientTunnel", "Connected directly to ${hostInfo.hostDisplayName} ($assignedIp)")
+
+        if (_clientSelectedMode.value == SharingMode.WHOLE_DEVICE_VPN) {
+            requestOrStartVpn()
+        }
+    }
+
+    private fun scheduleClientReconnect(reason: String) {
+        val attemptInfo = lastClientAttempt ?: return
+        if (clientReconnectJob?.isActive == true) return
+
+        activeClientMux?.close()
+        activeClientMux = null
+        activeClientTransport?.close()
+        activeClientTransport = null
+
+        clientReconnectJob = runtimeScope.launch {
+            for (attempt in 1..4) {
+                if (manualClientDisconnect) return@launch
+                ClientServiceBridge.statusTitle = "Reconnecting ($attempt/4)..."
+                _tunnelState.value = TunnelState.Reconnecting(attempt, reason)
+                logEvent("WARN", "ClientTunnel", "Auto-reconnect attempt $attempt: $reason")
+                delay(attempt * 2500L)
+                if (manualClientDisconnect) return@launch
+                if (attemptInfo.isOfflineRequest) {
+                    requestInternetOffline(attemptInfo.requestNote, attemptInfo.manualHostIp, attemptInfo.manualHostPort)
+                } else {
+                    requestClientJoin(attemptInfo.rawCodeOrQr, attemptInfo.manualHostIp, attemptInfo.manualHostPort)
+                }
+                return@launch
+            }
+        }
+    }
+
+    fun requestOrStartVpn() {
+        val transport = activeClientTransport
+        if (transport == null || !transport.isConnected) {
+            _statusBannerMessage.value = "Connect to a Host sharing code first before starting Whole-Device VPN."
+            return
+        }
+        val prepareIntent = VpnService.prepare(appContext)
+        if (prepareIntent != null) {
+            _pendingVpnPermissionEvent.value = prepareIntent
+        } else {
+            onVpnPermissionGranted()
+        }
+    }
+
+    fun consumeVpnPermissionEvent() {
+        _pendingVpnPermissionEvent.value = null
+    }
+
+    fun onVpnPermissionGranted() {
+        _clientSelectedMode.value = SharingMode.WHOLE_DEVICE_VPN
+        ClientServiceBridge.modeLabel = SharingMode.WHOLE_DEVICE_VPN.label
+        val intent = Intent(appContext, WiFiShareVpnService::class.java).apply {
+            action = WiFiShareVpnService.ACTION_START
+        }
+        ContextCompat.startForegroundService(appContext, intent)
+        logEvent("INFO", "VPN", "Started WiFiShareVpnService (MTU ${settings.value.vpnMtu})")
+    }
+
+    fun onVpnPermissionDenied() {
+        _statusBannerMessage.value = "Android VPN permission denied. Continuing in Browser & Downloads mode."
+        _clientSelectedMode.value = SharingMode.BROWSER_AND_DOWNLOADS
+        ClientServiceBridge.modeLabel = SharingMode.BROWSER_AND_DOWNLOADS.label
+        logEvent("WARN", "VPN", "User denied VpnService permission")
+    }
+
+    fun stopVpnOnly() {
+        val intent = Intent(appContext, WiFiShareVpnService::class.java).apply {
+            action = WiFiShareVpnService.ACTION_STOP
+        }
+        runCatching { appContext.startService(intent) }
+    }
+
+    fun disconnectClient() {
+        manualClientDisconnect = true
+        clientReconnectJob?.cancel()
+        clientConnectJob?.cancel()
+        activeClientConnector?.cancel()
+        activeClientConnector = null
+        beaconDiscovery.stopBroadcastingOfflineNeed()
+        stopVpnOnly()
+        stopClientForegroundService()
+
+        val snap = trafficAccounting.snapshot.value
+        val dur = if (sessionStartedAtMs > 0L) (System.currentTimeMillis() - sessionStartedAtMs) / 1000L else 0L
+        val peerName = _joinedHostInfo.value?.hostDisplayName ?: "Host"
+
+        activeClientMux?.close()
+        activeClientMux = null
+        activeClientTransport?.close()
+        activeClientTransport = null
+        VpnRuntimeBridge.activeTransport = null
+        VpnRuntimeBridge.activeCipher = null
+
+        runtimeScope.launch {
+            localRepo.recordSessionTraffic("CLIENT", peerName, snap.totalUploadedBytes, snap.totalDownloadedBytes, dur)
+        }
+
+        _joinedHostInfo.value = null
+        _tunnelState.value = TunnelState.Idle
+        logEvent("INFO", "Client", "Disconnected from Host")
+    }
+
+    fun getTunnelOkHttpClientOrNull(): OkHttpClient? {
+        val connected = _tunnelState.value as? TunnelState.Connected ?: return null
+        if (connected.role != "CLIENT") return null
+        return activeClientMux?.createTunnelOkHttpClient()
+    }
+
+    fun isDownloadAllowedBySession(): Boolean {
+        val connected = _tunnelState.value as? TunnelState.Connected ?: return true
+        if (connected.role == "HOST") return true
+        val hostPermitted = _joinedHostInfo.value?.permittedModes ?: return true
+        return connected.mode != SharingMode.BROWSER_ONLY &&
+            (SharingMode.BROWSER_AND_DOWNLOADS in hostPermitted || SharingMode.WHOLE_DEVICE_VPN in hostPermitted)
+    }
+
+    // =========================================================================
+    // DIAGNOSTICS & TELEMETRY
+    // =========================================================================
+
+    fun runNetworkDiagnosticsProbes() {
+        runtimeScope.launch {
+            val cfg = settings.value
+            val results = mutableListOf<DiagnosticProbeResult>()
+
+            connectivityMonitor.refresh()
+            val net = activeNetwork.value
+            results.add(
+                DiagnosticProbeResult(
+                    "Physical Network & Local Link",
+                    net.isConnected || net.hasLocalLink,
+                    when {
+                        net.isConnected -> "${net.transport.name} (${net.interfaceName}, ${net.localIp})"
+                        net.hasLocalLink -> "Offline Local Link Ready (${net.interfaceName}, ${net.localIp})"
+                        else -> "Offline (can still start Host standby or Wi-Fi Direct)"
+                    }
+                )
+            )
+
+            val dbOk = runCatching {
+                localRepo.findAccountByEmail(_authSession.value.email)
+                true
+            }.getOrDefault(false)
+            results.add(
+                DiagnosticProbeResult(
+                    "In-App Local Storage (Room SQLite)",
+                    dbOk,
+                    if (dbOk) "Encrypted session, trusted peers & local Room database operational" else "Database unavailable"
+                )
+            )
+
+            val activePort = hostGatewayServer?.actualListenPort
+            val gatewayProbe = if (activePort != null && hostGatewayServer?.isRunning == true) {
+                true to "Host gateway actively listening in background on port $activePort"
+            } else {
+                runCatching {
+                    ServerSocket().use { ss ->
+                        ss.reuseAddress = true
+                        ss.bind(InetSocketAddress(cfg.directListenPort))
+                        true to "Port ${cfg.directListenPort} available for direct Host listening"
+                    }
+                }.getOrElse {
+                    true to "Preferred port ${cfg.directListenPort} busy; automatic fallback port ready"
+                }
+            }
+            results.add(DiagnosticProbeResult("Direct P2P Gateway Socket", gatewayProbe.first, gatewayProbe.second))
+
+            val nsdOk = nsdDiscovery.isSupported()
+            results.add(
+                DiagnosticProbeResult(
+                    "Offline Discovery (NSD + UDP Beacon + Wi-Fi Direct)",
+                    nsdOk || wifiDirectManager.state.value.isSupported,
+                    "NSD=${if (nsdOk) "ready" else "n/a"}, UDP Beacon=port ${LocalBeaconDiscovery.BEACON_PORT}, Wi-Fi Direct=${if (wifiDirectManager.state.value.isSupported) "supported" else "n/a"}"
+                )
+            )
+
+            val stun = if (net.isConnected) StunClient.discoverPublicEndpoint(cfg.stunHost, cfg.stunPort) else null
+            results.add(
+                DiagnosticProbeResult(
+                    "STUN Reflexive Endpoint (Online Optional)",
+                    stun?.isSuccess ?: false,
+                    stun?.getOrNull()?.let { "${it.publicIp}:${it.publicPort} (${it.rttMs} ms)" }
+                        ?: "Offline / skipped — offline LAN, Hotspot, and Wi-Fi Direct still work"
+                )
+            )
+
+            val vpnReady = VpnService.prepare(appContext) == null
+            results.add(
+                DiagnosticProbeResult(
+                    "Android VpnService Consent",
+                    vpnReady,
+                    if (vpnReady) "Granted by system" else "Not yet granted (required for Mode C)"
+                )
+            )
+
+            _diagnosticProbes.value = results
+        }
+    }
+
+    fun askAiDiagnostics(query: String) {
+        if (query.isBlank()) return
+        runtimeScope.launch {
+            val net = activeNetwork.value
+            val tState = _tunnelState.value
+            val snap = liveTraffic.value
+            val cfg = settings.value
+            val p2p = offlineP2pState.value
+            val probesSummary = _diagnosticProbes.value.joinToString("\n") {
+                "- ${it.name}: ${if (it.passed == true) "PASS" else "FAIL"} (${it.detail})"
+            }
+            val recentLogs = tunnelEvents.let { "" }
+            val contextText = """
+                Mode: Background Foreground Services (Host + Client + VPN) & Offline Local Accept
+                Network: ${net.transport.name}, internet=${net.isConnected}, hasLocalLink=${net.hasLocalLink}, iface=${net.interfaceName}, localIp=${net.localIp}
+                Host Service Running: ${isHostServiceRunning.value} | Client Service Running: ${isClientServiceRunning.value} | VPN Running: ${isVpnActive.value}
+                Wi-Fi Direct Group Active: ${p2p.isGroupActive} (owner=${p2p.isGroupOwner}, ip=${p2p.groupOwnerIp})
+                TunnelState: $tState
+                Traffic: Up=${snap.totalUploadedBytes}B (${snap.uploadBps}B/s), Down=${snap.totalDownloadedBytes}B (${snap.downloadBps}B/s), RTT=${snap.tunnelLatencyMs}ms
+                Auto-Accept Trusted Peers: ${cfg.autoAcceptTrustedPeers}
+                Probes:
+                $probesSummary
+                $recentLogs
+            """.trimIndent()
+
+            aiDiagnostics.analyzeDiagnostics(query, contextText)
+        }
+    }
+
+    private fun startTelemetrySampler() {
+        telemetryLoopJob?.cancel()
+        telemetryLoopJob = runtimeScope.launch {
+            while (isActive) {
+                delay(1000)
+                trafficAccounting.sampleSecond()
+                val snap = trafficAccounting.snapshot.value
+                HostServiceBridge.uploadBps = snap.uploadBps
+                HostServiceBridge.downloadBps = snap.downloadBps
+                ClientServiceBridge.uploadBps = snap.uploadBps
+                ClientServiceBridge.downloadBps = snap.downloadBps
+
+                val cfg = settings.value
+                if (cfg.enforceDataLimit && _tunnelState.value is TunnelState.Connected) {
+                    val totalMb = (snap.totalUploadedBytes + snap.totalDownloadedBytes) / (1024L * 1024L)
+                    if (totalMb >= cfg.dataLimitMb) {
+                        val role = (_tunnelState.value as TunnelState.Connected).role
+                        logEvent("WARN", "Quota", "Configured data limit (${cfg.dataLimitMb} MB) reached; disconnecting.")
+                        if (role == "HOST") stopHostSharing() else disconnectClient()
+                        _statusBannerMessage.value = "Session disconnected: ${cfg.dataLimitMb} MB data limit reached."
+                    }
+                }
+            }
+        }
+    }
+
+    private fun startHostForegroundService() {
+        val intent = Intent(appContext, HostSharingService::class.java).apply {
+            action = HostSharingService.ACTION_START
+        }
+        ContextCompat.startForegroundService(appContext, intent)
+    }
+
+    private fun startClientForegroundService() {
+        val intent = Intent(appContext, ClientTunnelService::class.java).apply {
+            action = ClientTunnelService.ACTION_START
+        }
+        ContextCompat.startForegroundService(appContext, intent)
+    }
+
+    private fun stopClientForegroundService() {
+        val intent = Intent(appContext, ClientTunnelService::class.java).apply {
+            action = ClientTunnelService.ACTION_STOP
+        }
+        runCatching { appContext.startService(intent) }
+    }
+
+    private fun generateSharingCode(): String {
+        val alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        val rng = SecureRandom()
+        fun group(): String = buildString(4) {
+            repeat(4) { append(alphabet[rng.nextInt(alphabet.length)]) }
+        }
+        return "WFS-${group()}-${group()}"
+    }
+
+    private fun logEvent(level: String, component: String, message: String) {
+        runtimeScope.launch {
+            localRepo.logEvent(level, component, message)
+        }
+    }
+
+    companion object {
+        private const val TAG = "WiFiShareRuntime"
+
+        @Volatile
+        private var INSTANCE: WiFiShareRuntime? = null
+
+        fun getInstance(context: Context): WiFiShareRuntime {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: WiFiShareRuntime(context.applicationContext).also { INSTANCE = it }
+            }
+        }
+    }
+}

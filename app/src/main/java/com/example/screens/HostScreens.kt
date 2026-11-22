@@ -1,6 +1,8 @@
 package com.example.screens
 
 import android.content.Intent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -22,6 +24,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.QrCode2
@@ -29,10 +32,10 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.StopCircle
+import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.filled.WifiTethering
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -45,6 +48,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -59,12 +63,16 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.database.SavedPeerEntity
 import com.example.model.ActiveNetworkInfo
 import com.example.model.ConnectedPeer
 import com.example.model.LiveTrafficSnapshot
+import com.example.model.NearbyOfflineNeed
+import com.example.model.OfflineP2pState
 import com.example.model.PendingJoinRequest
 import com.example.model.SharingCodeState
 import com.example.model.TunnelState
+import com.example.networking.transport.OfflineWifiDirectManager
 import com.example.qr.QrCodeGenerator
 import com.example.settings.WiFiShareSettings
 import com.example.ui.components.GlassCard
@@ -88,18 +96,39 @@ fun HostModeScreen(
     settings: WiFiShareSettings,
     connectedPeers: List<ConnectedPeer>,
     pendingRequests: List<PendingJoinRequest>,
+    nearbyOfflineNeeds: List<NearbyOfflineNeed>,
+    isHostServiceRunning: Boolean,
+    offlineP2pState: OfflineP2pState,
     onStartSharing: () -> Unit,
     onStopSharing: () -> Unit,
+    onStartOfflineWifiDirectGroup: () -> Unit,
+    onStopOfflineWifiDirect: () -> Unit,
     onUpdatePermittedModes: (Boolean, Boolean, Boolean) -> Unit,
     onUpdateMaxDevices: (Int) -> Unit,
+    onUpdateAutoAcceptTrusted: (Boolean) -> Unit,
+    onUpdateAllowOpenOfflineRequests: (Boolean) -> Unit,
     onOpenSharingCode: () -> Unit,
     onOpenApprovals: () -> Unit,
     onOpenConnectedDevices: () -> Unit,
     onBack: (() -> Unit)? = null
 ) {
+    val context = LocalContext.current
     val semantic = LocalWiFiShareColors.current
     val isHostActive = (tunnelState as? TunnelState.Connected)?.role == "HOST"
     var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var permissionHint by remember { mutableStateOf<String?>(null) }
+
+    val p2pPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            permissionHint = null
+            onStartOfflineWifiDirectGroup()
+        } else {
+            permissionHint = "Nearby Wi-Fi permission denied. You can still share over Wi-Fi or Portable Hotspot."
+        }
+    }
+
     LaunchedEffect(isHostActive) {
         while (isHostActive) {
             nowMs = System.currentTimeMillis()
@@ -141,20 +170,24 @@ fun HostModeScreen(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Column {
-                                Text("Active Egress Source", style = MaterialTheme.typography.titleMedium)
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Host Gateway & Background Mode", style = MaterialTheme.typography.titleMedium)
                                 Text(
-                                    text = if (networkInfo.isConnected) {
-                                        "${networkInfo.transport.name} • ${networkInfo.interfaceName} (${networkInfo.localIp})"
-                                    } else {
-                                        "No internet connection"
+                                    text = when {
+                                        networkInfo.isConnected -> "${networkInfo.transport.name} • ${networkInfo.interfaceName} (${networkInfo.localIp})"
+                                        networkInfo.hasLocalLink -> "Offline Local Link • ${networkInfo.interfaceName} (${networkInfo.localIp})"
+                                        else -> "Offline Standby • Accepts local Hotspot / Wi-Fi Direct connections"
                                     },
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                             StatusPill(
-                                label = if (isHostActive) "SHARING ON" else "STOPPED",
+                                label = when {
+                                    isHostActive && isHostServiceRunning -> "BG SHARING ON"
+                                    isHostActive -> "SHARING ON"
+                                    else -> "STOPPED"
+                                },
                                 color = if (isHostActive) semantic.success else MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
@@ -170,11 +203,15 @@ fun HostModeScreen(
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
+                            Text(
+                                text = "Runs continuously in the background with notification Accept / Reject controls.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = semantic.success
+                            )
                         }
 
                         Button(
                             onClick = if (isHostActive) onStopSharing else onStartSharing,
-                            enabled = networkInfo.isConnected || isHostActive,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(52.dp)
@@ -190,7 +227,73 @@ fun HostModeScreen(
                                 contentDescription = null
                             )
                             Spacer(Modifier.size(8.dp))
-                            Text(if (isHostActive) "Stop Sharing Immediately" else "Start Sharing Internet")
+                            Text(
+                                when {
+                                    isHostActive -> "Stop Sharing Immediately"
+                                    networkInfo.isConnected -> "Start Background Host Sharing"
+                                    else -> "Start Offline Host & Accept Mode"
+                                }
+                            )
+                        }
+                    }
+                }
+
+                // Offline Wi-Fi Direct Group Card (Works with Zero Router / Zero Internet)
+                GlassCard(modifier = Modifier.fillMaxWidth()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Offline Wi-Fi Direct Link", style = MaterialTheme.typography.titleMedium)
+                            StatusPill(
+                                label = if (offlineP2pState.isGroupActive) "P2P ACTIVE" else "READY",
+                                color = if (offlineP2pState.isGroupActive) semantic.success else semantic.cyanAccent
+                            )
+                        }
+                        Text(
+                            text = offlineP2pState.statusMessage,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (offlineP2pState.isGroupActive && offlineP2pState.groupSsid.isNotBlank()) {
+                            Text(
+                                text = "SSID: ${offlineP2pState.groupSsid}\nPassphrase: ${offlineP2pState.groupPassphrase}\nGateway IP: ${offlineP2pState.groupOwnerIp.ifBlank { "192.168.49.1" }}",
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFontFamily),
+                                color = semantic.cyanAccent
+                            )
+                        }
+                        permissionHint?.let { hint ->
+                            Text(hint, style = MaterialTheme.typography.bodySmall, color = semantic.warning)
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    if (OfflineWifiDirectManager.hasRequiredPermission(context)) {
+                                        onStartOfflineWifiDirectGroup()
+                                    } else {
+                                        p2pPermissionLauncher.launch(OfflineWifiDirectManager.requiredPermission())
+                                    }
+                                },
+                                enabled = offlineP2pState.isSupported,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("host_wifi_direct_btn")
+                            ) {
+                                Text(if (offlineP2pState.isGroupActive) "Refresh P2P Group" else "Create Offline P2P Group")
+                            }
+                            if (offlineP2pState.isGroupActive) {
+                                OutlinedButton(
+                                    onClick = onStopOfflineWifiDirect,
+                                    modifier = Modifier.testTag("host_stop_wifi_direct_btn")
+                                ) {
+                                    Text("Stop P2P")
+                                }
+                            }
                         }
                     }
                 }
@@ -237,7 +340,7 @@ fun HostModeScreen(
                 // Host Policy Controls
                 GlassCard(modifier = Modifier.fillMaxWidth()) {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text("Permitted Access Modes", style = MaterialTheme.typography.titleMedium)
+                        Text("Permitted Access Modes & Offline Trust", style = MaterialTheme.typography.titleMedium)
 
                         ModeSwitchRow(
                             title = "Mode A · Built-in Browser",
@@ -254,6 +357,17 @@ fun HostModeScreen(
                             checked = settings.allowVpnMode,
                             onCheckedChange = { onUpdatePermittedModes(settings.allowBrowserMode, settings.allowDownloadsMode, it) }
                         )
+                        ModeSwitchRow(
+                            title = "Auto-Accept Trusted Offline Peers",
+                            checked = settings.autoAcceptTrustedPeers,
+                            onCheckedChange = onUpdateAutoAcceptTrusted
+                        )
+                        ModeSwitchRow(
+                            title = "Allow Open Offline Internet Requests (No Code)",
+                            checked = settings.allowOpenOfflineRequests,
+                            onCheckedChange = onUpdateAllowOpenOfflineRequests,
+                            switchTestTag = "host_allow_open_offline_switch"
+                        )
 
                         Spacer(Modifier.height(4.dp))
                         Text(
@@ -268,6 +382,39 @@ fun HostModeScreen(
                         )
                     }
                 }
+                if (nearbyOfflineNeeds.isNotEmpty()) {
+                    GlassCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        borderColor = semantic.warning.copy(alpha = 0.55f)
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Nearby Offline Requesters", style = MaterialTheme.typography.titleMedium)
+                                StatusPill("${nearbyOfflineNeeds.size} NEARBY", semantic.warning)
+                            }
+                            nearbyOfflineNeeds.forEach { need ->
+                                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text(
+                                        "${need.deviceName} (${need.senderIp}) · ${need.requestedMode.label}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    if (need.note.isNotBlank()) {
+                                        Text(
+                                            "\"${need.note}\"",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = semantic.cyanAccent
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -277,15 +424,25 @@ fun HostModeScreen(
 private fun ModeSwitchRow(
     title: String,
     checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
+    onCheckedChange: (Boolean) -> Unit,
+    switchTestTag: String = ""
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(title, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+        Text(
+            title,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.weight(1f)
+        )
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            modifier = if (switchTestTag.isNotBlank()) Modifier.testTag(switchTestTag) else Modifier
+        )
     }
 }
 
@@ -354,7 +511,7 @@ fun SharingCodeScreen(
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                             Text(
-                                text = "Expires in ${formatDuration(remainingSec)} • Approval required",
+                                text = "Expires in ${formatDuration(remainingSec)} • Offline & online approval ready",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -377,7 +534,7 @@ fun SharingCodeScreen(
                             }
 
                             Text(
-                                text = "Direct Socket: ${sharingCode.listenHost}:${sharingCode.listenPort} • NAT: ${sharingCode.stunEndpoint}",
+                                text = "Direct Socket: ${sharingCode.listenHost}:${sharingCode.listenPort} • ${sharingCode.stunEndpoint}",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -444,8 +601,16 @@ fun SharingCodeScreen(
 @Composable
 fun ApprovalScreen(
     pendingRequests: List<PendingJoinRequest>,
-    onApprove: (PendingJoinRequest) -> Unit,
+    nearbyOfflineNeeds: List<NearbyOfflineNeed>,
+    savedClients: List<SavedPeerEntity>,
+    autoAcceptTrusted: Boolean,
+    allowOpenOfflineRequests: Boolean,
+    onToggleAutoAcceptTrusted: (Boolean) -> Unit,
+    onToggleAllowOpenOfflineRequests: (Boolean) -> Unit,
+    onApprove: (PendingJoinRequest, Boolean) -> Unit,
     onReject: (PendingJoinRequest) -> Unit,
+    onSetClientTrusted: (SavedPeerEntity, Boolean) -> Unit,
+    onRemoveSavedClient: (Long) -> Unit,
     onBack: () -> Unit
 ) {
     val semantic = LocalWiFiShareColors.current
@@ -461,10 +626,26 @@ fun ApprovalScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            GlassCard(modifier = Modifier.fillMaxWidth()) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ModeSwitchRow(
+                        title = "Auto-Accept Trusted Devices Offline & Background",
+                        checked = autoAcceptTrusted,
+                        onCheckedChange = onToggleAutoAcceptTrusted
+                    )
+                    ModeSwitchRow(
+                        title = "Allow Open Offline Internet Requests (No Code)",
+                        checked = allowOpenOfflineRequests,
+                        onCheckedChange = onToggleAllowOpenOfflineRequests
+                    )
+                }
+            }
+
+            Text("Pending Requests", style = MaterialTheme.typography.titleMedium)
             if (pendingRequests.isEmpty()) {
                 GlassCard(modifier = Modifier.fillMaxWidth()) {
                     Text(
-                        text = "No pending client connection requests. Incoming requests appear here for your explicit authorization.",
+                        text = "No pending client connection requests. Incoming code or offline requests can be accepted here or directly from the background notification.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -473,15 +654,35 @@ fun ApprovalScreen(
                 pendingRequests.forEach { req ->
                     GlassCard(
                         modifier = Modifier.fillMaxWidth(),
-                        borderColor = semantic.cyanAccent.copy(alpha = 0.45f)
+                        borderColor = if (req.isOfflineRequest) {
+                            semantic.warning.copy(alpha = 0.55f)
+                        } else {
+                            semantic.cyanAccent.copy(alpha = 0.45f)
+                        }
                     ) {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text(req.clientName, style = MaterialTheme.typography.titleMedium)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(req.clientName, style = MaterialTheme.typography.titleMedium)
+                                if (req.isOfflineRequest) {
+                                    StatusPill("OFFLINE REQUEST", semantic.warning)
+                                }
+                            }
                             Text(
                                 "Mode: ${req.requestedMode.label}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = semantic.cyanAccent
                             )
+                            if (req.requestNote.isNotBlank()) {
+                                Text(
+                                    "Note: \"${req.requestNote}\"",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
                             Text(
                                 "Endpoint: ${req.clientEndpoint} • Requested: ${req.requestedAt}",
                                 style = MaterialTheme.typography.labelSmall,
@@ -489,24 +690,91 @@ fun ApprovalScreen(
                             )
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 OutlinedButton(
                                     onClick = { onReject(req) },
                                     modifier = Modifier.weight(1f).testTag("reject_peer_${req.connectionId}")
                                 ) {
                                     Icon(Icons.Default.Close, contentDescription = null, modifier = Modifier.size(16.dp))
-                                    Spacer(Modifier.size(6.dp))
+                                    Spacer(Modifier.size(4.dp))
                                     Text("Reject")
                                 }
-                                Button(
-                                    onClick = { onApprove(req) },
+                                OutlinedButton(
+                                    onClick = { onApprove(req, false) },
                                     modifier = Modifier.weight(1f).testTag("approve_peer_${req.connectionId}")
                                 ) {
                                     Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp))
-                                    Spacer(Modifier.size(6.dp))
+                                    Spacer(Modifier.size(4.dp))
                                     Text("Approve")
                                 }
+                            }
+                            Button(
+                                onClick = { onApprove(req, true) },
+                                modifier = Modifier.fillMaxWidth().testTag("trust_approve_peer_${req.connectionId}")
+                            ) {
+                                Icon(Icons.Default.VerifiedUser, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.size(6.dp))
+                                Text("Trust & Accept (Auto-Accept Offline)")
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (nearbyOfflineNeeds.isNotEmpty()) {
+                Spacer(Modifier.height(4.dp))
+                Text("Nearby Offline Need Broadcasts", style = MaterialTheme.typography.titleMedium)
+                nearbyOfflineNeeds.forEach { need ->
+                    GlassCard(modifier = Modifier.fillMaxWidth()) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(need.deviceName, style = MaterialTheme.typography.titleSmall)
+                            Text(
+                                "${need.senderIp} • ${need.requestedMode.label}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = semantic.cyanAccent
+                            )
+                            if (need.note.isNotBlank()) {
+                                Text(
+                                    "\"${need.note}\"",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (savedClients.isNotEmpty()) {
+                Spacer(Modifier.height(4.dp))
+                Text("Saved Offline Client Devices", style = MaterialTheme.typography.titleMedium)
+                savedClients.forEach { client ->
+                    val isTrusted = client.approvalStatus == "TRUSTED"
+                    GlassCard(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(client.peerName, style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    "${client.approvalStatus} • ${client.hostIp}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (isTrusted) semantic.success else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(
+                                checked = isTrusted,
+                                onCheckedChange = { onSetClientTrusted(client, it) }
+                            )
+                            IconButton(onClick = { onRemoveSavedClient(client.id) }) {
+                                Icon(
+                                    imageVector = Icons.Default.Delete,
+                                    contentDescription = "Remove ${client.peerName}",
+                                    tint = MaterialTheme.colorScheme.error
+                                )
                             }
                         }
                     }

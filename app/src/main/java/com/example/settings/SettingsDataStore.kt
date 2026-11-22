@@ -45,7 +45,9 @@ data class WiFiShareSettings(
     val vpnMtu: Int = 1400,
     val dnsLeakProtection: Boolean = true,
     val ipv6Enabled: Boolean = true,
-    val notificationsEnabled: Boolean = true
+    val notificationsEnabled: Boolean = true,
+    val autoAcceptTrustedPeers: Boolean = true,
+    val allowOpenOfflineRequests: Boolean = true
 )
 
 class SettingsDataStore(private val context: Context) {
@@ -76,7 +78,9 @@ class SettingsDataStore(private val context: Context) {
             vpnMtu = prefs[KEY_VPN_MTU] ?: 1400,
             dnsLeakProtection = prefs[KEY_DNS_LEAK_PROTECTION] ?: true,
             ipv6Enabled = prefs[KEY_IPV6_ENABLED] ?: true,
-            notificationsEnabled = prefs[KEY_NOTIFICATIONS] ?: true
+            notificationsEnabled = prefs[KEY_NOTIFICATIONS] ?: true,
+            autoAcceptTrustedPeers = prefs[KEY_AUTO_ACCEPT_TRUSTED] ?: true,
+            allowOpenOfflineRequests = prefs[KEY_ALLOW_OPEN_OFFLINE_REQUESTS] ?: true
         )
     }
 
@@ -112,6 +116,8 @@ class SettingsDataStore(private val context: Context) {
         it[KEY_IPV6_ENABLED] = ipv6
     }
     suspend fun setNotificationsEnabled(enabled: Boolean) = update { it[KEY_NOTIFICATIONS] = enabled }
+    suspend fun setAutoAcceptTrustedPeers(enabled: Boolean) = update { it[KEY_AUTO_ACCEPT_TRUSTED] = enabled }
+    suspend fun setAllowOpenOfflineRequests(enabled: Boolean) = update { it[KEY_ALLOW_OPEN_OFFLINE_REQUESTS] = enabled }
 
     private suspend fun update(block: (androidx.datastore.preferences.core.MutablePreferences) -> Unit) {
         context.wifiShareDataStore.edit(block)
@@ -139,5 +145,7 @@ class SettingsDataStore(private val context: Context) {
         private val KEY_DNS_LEAK_PROTECTION = booleanPreferencesKey("dns_leak_protection")
         private val KEY_IPV6_ENABLED = booleanPreferencesKey("ipv6_enabled")
         private val KEY_NOTIFICATIONS = booleanPreferencesKey("notifications_enabled")
+        private val KEY_AUTO_ACCEPT_TRUSTED = booleanPreferencesKey("auto_accept_trusted_peers")
+        private val KEY_ALLOW_OPEN_OFFLINE_REQUESTS = booleanPreferencesKey("allow_open_offline_requests")
     }
 }

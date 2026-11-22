@@ -29,9 +29,30 @@ enum class NetworkTransportType {
 data class ActiveNetworkInfo(
     val transport: NetworkTransportType = NetworkTransportType.OFFLINE,
     val isConnected: Boolean = false,
+    val hasLocalLink: Boolean = false,
     val isMetered: Boolean = false,
     val interfaceName: String = "Unavailable",
-    val localIp: String = "—"
+    val localIp: String = "—",
+    val localAddresses: List<String> = emptyList()
+)
+
+data class OfflineP2pPeer(
+    val deviceName: String,
+    val deviceAddress: String,
+    val statusLabel: String
+)
+
+data class OfflineP2pState(
+    val isSupported: Boolean = false,
+    val isEnabled: Boolean = false,
+    val isDiscovering: Boolean = false,
+    val isGroupActive: Boolean = false,
+    val isGroupOwner: Boolean = false,
+    val groupSsid: String = "",
+    val groupPassphrase: String = "",
+    val groupOwnerIp: String = "",
+    val statusMessage: String = "Idle",
+    val peers: List<OfflineP2pPeer> = emptyList()
 )
 
 sealed interface TunnelState {
@@ -75,7 +96,18 @@ data class PendingJoinRequest(
     val requestedMode: SharingMode,
     val clientPublicKeyB64: String,
     val clientEndpoint: String,
-    val requestedAt: String
+    val requestedAt: String,
+    val isOfflineRequest: Boolean = false,
+    val requestNote: String = ""
+)
+
+data class NearbyOfflineNeed(
+    val deviceUuid: String,
+    val deviceName: String,
+    val requestedMode: SharingMode,
+    val note: String,
+    val senderIp: String,
+    val seenAtMs: Long = System.currentTimeMillis()
 )
 
 data class ConnectedPeer(
@@ -116,7 +148,8 @@ data class HostPublicInfo(
     val permittedModes: Set<SharingMode>,
     val maxDevices: Int,
     val activeDevices: Int,
-    val expiresAtEpochSec: Long
+    val expiresAtEpochSec: Long,
+    val resolvedSharingCode: String = ""
 )
 
 data class DiscoveredHostPeer(

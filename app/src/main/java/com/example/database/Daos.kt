@@ -44,8 +44,17 @@ interface SavedPeerDao {
     @Query("SELECT * FROM saved_peers WHERE role = :role ORDER BY lastConnectedAt DESC LIMIT 50")
     fun observeByRole(role: String): Flow<List<SavedPeerEntity>>
 
+    @Query("SELECT deviceUuid FROM saved_peers WHERE role = 'CLIENT' AND approvalStatus = 'TRUSTED'")
+    suspend fun getTrustedClientUuids(): List<String>
+
+    @Query("SELECT * FROM saved_peers WHERE role = 'HOST' AND UPPER(sharingCode) = UPPER(:code) ORDER BY lastConnectedAt DESC LIMIT 1")
+    suspend fun getHostBySharingCode(code: String): SavedPeerEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(peer: SavedPeerEntity): Long
+
+    @Query("UPDATE saved_peers SET approvalStatus = :status WHERE id = :id")
+    suspend fun updateApprovalStatus(id: Long, status: String)
 
     @Query("DELETE FROM saved_peers WHERE id = :id")
     suspend fun deleteById(id: Long)

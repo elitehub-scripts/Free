@@ -78,17 +78,26 @@ import com.example.ui.theme.WiFiShareTheme
 import com.example.viewmodel.WiFiShareViewModel
 import kotlinx.coroutines.launch
 
+import android.content.Intent
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
 class MainActivity : ComponentActivity() {
+
+    private val _pendingNotificationRoute = MutableStateFlow<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         // Mandatory Step 1: Configure Firebase App Check with launch intent before Compose UI or ViewModels
         configureAppCheck(this, intent)
+        handleNotificationIntent(intent)
 
         enableEdgeToEdge()
         setContent {
             val viewModel: WiFiShareViewModel = viewModel()
             val settings by viewModel.settings.collectAsStateWithLifecycle()
+            val pendingRoute by _pendingNotificationRoute.asStateFlow().collectAsStateWithLifecycle()
             val isDark = when (settings.themeMode) {
                 AppThemeMode.DARK -> true
                 AppThemeMode.LIGHT -> false
@@ -96,9 +105,33 @@ class MainActivity : ComponentActivity() {
             }
 
             WiFiShareTheme(darkTheme = isDark) {
-                WiFiShareAppShell(viewModel = viewModel)
+                WiFiShareAppShell(
+                    viewModel = viewModel,
+                    pendingNotificationRoute = pendingRoute,
+                    onConsumeNotificationRoute = { _pendingNotificationRoute.value = null }
+                )
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleNotificationIntent(intent)
+    }
+
+    private fun handleNotificationIntent(intent: Intent?) {
+        val route = intent?.getStringExtra(EXTRA_OPEN_ROUTE)
+        if (!route.isNullOrBlank()) {
+            _pendingNotificationRoute.value = route
+        }
+    }
+
+    companion object {
+        const val EXTRA_OPEN_ROUTE = "extra_open_route"
+        const val ROUTE_ARG_HOST = "host"
+        const val ROUTE_ARG_APPROVALS = "approvals"
+        const val ROUTE_ARG_CLIENT = "client"
     }
 }
 
@@ -110,7 +143,11 @@ private data class TopLevelNavItem(
 )
 
 @Composable
-private fun WiFiShareAppShell(viewModel: WiFiShareViewModel) {
+private fun WiFiShareAppShell(
+    viewModel: WiFiShareViewModel,
+    pendingNotificationRoute: String?,
+    onConsumeNotificationRoute: () -> Unit
+) {
     val context = LocalContext.current
     val navController = rememberNavController()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -129,6 +166,9 @@ private fun WiFiShareAppShell(viewModel: WiFiShareViewModel) {
     val joinedHost by viewModel.joinedHostInfo.collectAsStateWithLifecycle()
     val traffic by viewModel.liveTraffic.collectAsStateWithLifecycle()
     val isVpnActive by viewModel.isVpnActive.collectAsStateWithLifecycle()
+    val isHostServiceRunning by viewModel.isHostServiceRunning.collectAsStateWithLifecycle()
+    val isClientServiceRunning by viewModel.isClientServiceRunning.collectAsStateWithLifecycle()
+    val offlineP2pState by viewModel.offlineP2pState.collectAsStateWithLifecycle()
     val pendingVpnIntent by viewModel.pendingVpnPermissionEvent.collectAsStateWithLifecycle()
     val statusBanner by viewModel.statusBannerMessage.collectAsStateWithLifecycle()
 
@@ -151,7 +191,9 @@ private fun WiFiShareAppShell(viewModel: WiFiShareViewModel) {
     val aiUiState by viewModel.aiUiState.collectAsStateWithLifecycle()
     val discoveredHosts by viewModel.discoveredHosts.collectAsStateWithLifecycle()
     val isNsdScanning by viewModel.isNsdScanning.collectAsStateWithLifecycle()
+    val nearbyOfflineNeeds by viewModel.nearbyOfflineNeeds.collectAsStateWithLifecycle()
     val savedHosts by viewModel.savedHosts.collectAsStateWithLifecycle()
+    val savedClients by viewModel.savedClients.collectAsStateWithLifecycle()
 
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -196,6 +238,20 @@ private fun WiFiShareAppShell(viewModel: WiFiShareViewModel) {
             navController.navigate(WiFiShareRoute.Home) {
                 popUpTo(WiFiShareRoute.Auth) { inclusive = true }
             }
+        }
+    }
+
+    LaunchedEffect(pendingNotificationRoute, authSession.isSignedIn) {
+        val target = pendingNotificationRoute
+        if (target != null && authSession.isSignedIn) {
+            val dest: WiFiShareRoute = when (target) {
+                MainActivity.ROUTE_ARG_APPROVALS -> WiFiShareRoute.Approvals
+                MainActivity.ROUTE_ARG_HOST -> WiFiShareRoute.Host
+                MainActivity.ROUTE_ARG_CLIENT -> WiFiShareRoute.Client()
+                else -> WiFiShareRoute.Home
+            }
+            navController.navigate(dest) { launchSingleTop = true }
+            onConsumeNotificationRoute()
         }
     }
 
@@ -336,8 +392,13 @@ private fun WiFiShareAppShell(viewModel: WiFiShareViewModel) {
                             traffic = traffic,
                             connectedPeersCount = connectedPeers.size,
                             pendingRequestsCount = pendingRequests.size,
+                            isBackgroundServiceActive = isHostServiceRunning || isClientServiceRunning,
                             onNavigateHost = { navController.navigate(WiFiShareRoute.Host) },
                             onNavigateClient = { navController.navigate(WiFiShareRoute.Client()) },
+                            onRequestOfflineInternet = {
+                                viewModel.requestInternetOffline()
+                                navController.navigate(WiFiShareRoute.Client())
+                            },
                             onNavigateBrowser = { navController.navigate(WiFiShareRoute.Browser) },
                             onNavigateDownloads = { navController.navigate(WiFiShareRoute.Downloads) },
                             onNavigateVpn = { navController.navigate(WiFiShareRoute.VpnConnection) },
@@ -358,13 +419,24 @@ private fun WiFiShareAppShell(viewModel: WiFiShareViewModel) {
                             settings = settings,
                             connectedPeers = connectedPeers,
                             pendingRequests = pendingRequests,
+                            nearbyOfflineNeeds = nearbyOfflineNeeds,
+                            isHostServiceRunning = isHostServiceRunning,
+                            offlineP2pState = offlineP2pState,
                             onStartSharing = viewModel::startHostSharing,
                             onStopSharing = viewModel::stopHostSharing,
+                            onStartOfflineWifiDirectGroup = viewModel::startHostOfflineWifiDirectGroup,
+                            onStopOfflineWifiDirect = viewModel::stopOfflineWifiDirect,
                             onUpdatePermittedModes = { b, d, v ->
                                 uiScope.launch { viewModel.settingsStore.setPermittedModes(b, d, v) }
                             },
                             onUpdateMaxDevices = { max ->
                                 uiScope.launch { viewModel.settingsStore.setMaxConnectedDevices(max) }
+                            },
+                            onUpdateAutoAcceptTrusted = { autoAccept ->
+                                uiScope.launch { viewModel.settingsStore.setAutoAcceptTrustedPeers(autoAccept) }
+                            },
+                            onUpdateAllowOpenOfflineRequests = { allowOpen ->
+                                uiScope.launch { viewModel.settingsStore.setAllowOpenOfflineRequests(allowOpen) }
                             },
                             onOpenSharingCode = { navController.navigate(WiFiShareRoute.SharingCode) },
                             onOpenApprovals = { navController.navigate(WiFiShareRoute.Approvals) },
@@ -383,13 +455,18 @@ private fun WiFiShareAppShell(viewModel: WiFiShareViewModel) {
                             hostInfo = joinedHost,
                             traffic = traffic,
                             isVpnActive = isVpnActive,
+                            isClientServiceRunning = isClientServiceRunning,
                             discoveredHosts = discoveredHosts,
                             isScanningNearby = isNsdScanning,
+                            offlineP2pState = offlineP2pState,
                             savedHosts = savedHosts,
                             onStartNearbyScan = viewModel::startNearbyHostScan,
                             onStopNearbyScan = viewModel::stopNearbyHostScan,
+                            onScanOfflineWifiDirect = viewModel::scanOfflineWifiDirectPeers,
+                            onConnectOfflineWifiDirectPeer = viewModel::connectOfflineWifiDirectPeer,
                             onSelectMode = viewModel::selectClientMode,
                             onRequestJoin = viewModel::requestClientJoin,
+                            onRequestOfflineInternet = viewModel::requestInternetOffline,
                             onOpenQrScanner = { navController.navigate(WiFiShareRoute.QrScanner) },
                             onOpenBrowser = { navController.navigate(WiFiShareRoute.Browser) },
                             onOpenVpnScreen = { navController.navigate(WiFiShareRoute.VpnConnection) },
@@ -420,8 +497,20 @@ private fun WiFiShareAppShell(viewModel: WiFiShareViewModel) {
                     composable<WiFiShareRoute.Approvals> {
                         ApprovalScreen(
                             pendingRequests = pendingRequests,
-                            onApprove = { req -> viewModel.approvePeerRequest(req, true) },
-                            onReject = { req -> viewModel.approvePeerRequest(req, false) },
+                            nearbyOfflineNeeds = nearbyOfflineNeeds,
+                            savedClients = savedClients,
+                            autoAcceptTrusted = settings.autoAcceptTrustedPeers,
+                            allowOpenOfflineRequests = settings.allowOpenOfflineRequests,
+                            onToggleAutoAcceptTrusted = { enabled ->
+                                uiScope.launch { viewModel.settingsStore.setAutoAcceptTrustedPeers(enabled) }
+                            },
+                            onToggleAllowOpenOfflineRequests = { enabled ->
+                                uiScope.launch { viewModel.settingsStore.setAllowOpenOfflineRequests(enabled) }
+                            },
+                            onApprove = { req, trust -> viewModel.approvePeerRequest(req, true, trust) },
+                            onReject = { req -> viewModel.approvePeerRequest(req, false, false) },
+                            onSetClientTrusted = viewModel::setSavedPeerTrusted,
+                            onRemoveSavedClient = viewModel::removeSavedPeer,
                             onBack = { navController.popBackStack() }
                         )
                     }

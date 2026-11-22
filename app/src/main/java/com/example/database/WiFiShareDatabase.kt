@@ -82,6 +82,15 @@ class WiFiShareLocalRepository(private val db: WiFiShareDatabase) {
     suspend fun savePeerRecord(peer: SavedPeerEntity): Long =
         db.savedPeerDao().upsert(peer)
 
+    suspend fun getTrustedClientUuids(): Set<String> =
+        db.savedPeerDao().getTrustedClientUuids().toSet()
+
+    suspend fun getTrustedOrRecentHostByCode(code: String): SavedPeerEntity? =
+        db.savedPeerDao().getHostBySharingCode(code)
+
+    suspend fun updatePeerApprovalStatus(id: Long, status: String) =
+        db.savedPeerDao().updateApprovalStatus(id, status)
+
     suspend fun deletePeerRecord(id: Long) =
         db.savedPeerDao().deleteById(id)
 
