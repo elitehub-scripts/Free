@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">WiFiShare</string>
+    <string name="tagline">Encrypted Remote Internet Sharing</string>
+    <string name="host_trust_warning">Security Notice: Authorized clients route internet traffic through your connection and exit from your public IP address. Share access only with people you trust.</string>
+    <string name="client_trust_notice">Your encrypted traffic is forwarded through the Host\'s internet egress. Sensitive credentials remain protected end-to-end over HTTPS, and your tunnel key rotates per session.</string>
+    <string name="measurement_overhead_notice">Traffic counters are measured locally at the tunnel interface and may differ slightly from the remote peer due to encryption and packet framing overhead.</string>
+    <string name="notification_channel_tunnel">WiFiShare Active Tunnel</string>
+    <string name="notification_channel_downloads">WiFiShare Downloads</string>
+</resources>

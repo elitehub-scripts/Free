@@ -1,0 +1,6 @@
+{
+  "name": "WiFiShare",
+  "description": "Remote internet-sharing platform for Android with Host & Client modes, encrypted VPN tunneling, built-in browser, download manager, and PHP/MySQL backend.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
