@@ -438,6 +438,15 @@ private fun WiFiShareAppShell(
                             onUpdateAllowOpenOfflineRequests = { allowOpen ->
                                 uiScope.launch { viewModel.settingsStore.setAllowOpenOfflineRequests(allowOpen) }
                             },
+                            onUpdateAutoAcceptOpenRequests = { autoOpen ->
+                                uiScope.launch { viewModel.settingsStore.setAutoAcceptOpenRequests(autoOpen) }
+                            },
+                            onApproveRequest = { req, trust ->
+                                viewModel.approvePeerRequest(req, true, trust)
+                            },
+                            onRejectRequest = { req ->
+                                viewModel.approvePeerRequest(req, false, false)
+                            },
                             onOpenSharingCode = { navController.navigate(WiFiShareRoute.SharingCode) },
                             onOpenApprovals = { navController.navigate(WiFiShareRoute.Approvals) },
                             onOpenConnectedDevices = { navController.navigate(WiFiShareRoute.ConnectedDevices) }

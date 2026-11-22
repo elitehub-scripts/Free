@@ -10,10 +10,13 @@ import com.example.database.WiFiShareDatabase
 import com.example.database.WiFiShareLocalRepository
 import com.example.model.SharingMode
 import com.example.networking.crypto.TunnelCrypto
+import com.example.networking.proxy.LocalTunnelStreamMux
 import com.example.networking.transport.DirectClientConnector
 import com.example.networking.transport.DirectHostGatewayServer
+import com.example.networking.transport.DirectTcpProbe
 import com.example.networking.transport.TrafficAccounting
 import com.example.qr.QrCodeGenerator
+import com.example.vpn.HostGatewayForwarder
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -23,6 +26,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import okhttp3.Request
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -30,6 +34,11 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.util.concurrent.atomic.AtomicInteger
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
@@ -426,6 +435,263 @@ class ExampleRobolectricTest {
         } finally {
             connector.cancel()
             server.stop()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `direct tcp probe discovers host without opening pending request`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val hostKp = TunnelCrypto.generateEphemeralKeyPair()
+        val joinCalls = AtomicInteger(0)
+
+        val server = DirectHostGatewayServer(
+            sharingCode = "WFS-PRBE-2026",
+            hostDisplayName = "Probeable Host",
+            networkType = "WIFI",
+            hostPublicKeyB64 = TunnelCrypto.encodePublicKey(hostKp.public),
+            stunEndpoint = "direct",
+            permittedModesProvider = { SharingMode.entries.toSet() },
+            maxDevicesProvider = { 5 },
+            activeDevicesCountProvider = { 0 },
+            expiresAtEpochSec = (System.currentTimeMillis() / 1000L) + 600L,
+            scope = scope,
+            onJoinRequested = { joinCalls.incrementAndGet() },
+            onPendingClosed = {},
+            onServerError = {}
+        )
+
+        val port = server.start(0).getOrThrow()
+        try {
+            val discovered = withTimeout(3_000L) {
+                DirectTcpProbe.probeHost("127.0.0.1", port, timeoutMs = 1_000)
+            }
+            assertNotNull(discovered)
+            assertEquals("WFS-PRBE-2026", discovered!!.sharingCode)
+            assertEquals("Probeable Host", discovered.hostName)
+            assertEquals(port, discovered.hostPort)
+            assertEquals(0, joinCalls.get())
+        } finally {
+            server.stop()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `public open wifi share auto-accepts anyone nearby without manual tap`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val hostKp = TunnelCrypto.generateEphemeralKeyPair()
+        val clientKp = TunnelCrypto.generateEphemeralKeyPair()
+        val hostSecretSessionCode = "WFS-OPEN-8899"
+
+        val autoApprovedReq = CompletableDeferred<com.example.model.PendingJoinRequest>()
+        val clientAssignedIp = CompletableDeferred<String>()
+
+        val server = DirectHostGatewayServer(
+            sharingCode = hostSecretSessionCode,
+            hostDisplayName = "Public Host",
+            networkType = "WIFI",
+            hostPublicKeyB64 = TunnelCrypto.encodePublicKey(hostKp.public),
+            stunEndpoint = "direct",
+            permittedModesProvider = { SharingMode.entries.toSet() },
+            maxDevicesProvider = { 5 },
+            activeDevicesCountProvider = { 0 },
+            expiresAtEpochSec = (System.currentTimeMillis() / 1000L) + 600L,
+            scope = scope,
+            onJoinRequested = { req -> autoApprovedReq.completeExceptionally(AssertionError("Should auto-accept ${req.clientName}")) },
+            onPendingClosed = {},
+            onServerError = {},
+            allowOpenOfflineRequestsProvider = { true },
+            autoAcceptOpenRequestsProvider = { true },
+            onAutoApproveRequested = { req -> autoApprovedReq.complete(req) }
+        )
+
+        val port = server.start(0).getOrThrow()
+        val connector = DirectClientConnector(
+            hostIp = "127.0.0.1",
+            hostPort = port,
+            sharingCode = "",
+            deviceUuid = "random-nearby-guest",
+            deviceName = "Nearby Guest",
+            clientPublicKeyB64 = TunnelCrypto.encodePublicKey(clientKp.public),
+            requestedMode = SharingMode.BROWSER_ONLY,
+            stunEndpoint = "offline-local",
+            scope = scope,
+            isOfflineRequest = true,
+            requestNote = "Quick browse"
+        )
+
+        try {
+            val clientJob = scope.launch(Dispatchers.IO) {
+                connector.connectAndAwaitApproval(
+                    onAwaitingApproval = {},
+                    onRejected = { reason -> clientAssignedIp.completeExceptionally(AssertionError(reason)) },
+                    onApproved = { _, assignedIp, _ -> clientAssignedIp.complete(assignedIp) },
+                    onError = { err -> clientAssignedIp.completeExceptionally(err) }
+                )
+            }
+
+            val req = withTimeout(5_000L) { autoApprovedReq.await() }
+            val hostCipher = TunnelCrypto.deriveSessionCipher(
+                localKeyPair = hostKp,
+                remotePublicKeyB64 = req.clientPublicKeyB64,
+                sessionSalt = hostSecretSessionCode.toByteArray(Charsets.UTF_8),
+                isHost = true
+            )
+            val transport = server.approvePendingClient(
+                connectionId = req.connectionId,
+                assignedIp = "10.88.0.5",
+                cipher = hostCipher,
+                accounting = TrafficAccounting(),
+                onFrameReceived = {},
+                onTransportError = {}
+            ).getOrThrow()
+
+            val ip = withTimeout(5_000L) { clientAssignedIp.await() }
+            assertEquals("10.88.0.5", ip)
+            transport.close()
+            clientJob.cancel()
+        } finally {
+            connector.cancel()
+            server.stop()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `browser stream mux forwards immediate http request and response through host gateway forwarder`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val hostKp = TunnelCrypto.generateEphemeralKeyPair()
+        val clientKp = TunnelCrypto.generateEphemeralKeyPair()
+        val code = "WFS-HTTP-5511"
+
+        // Local upstream HTTP test server simulating the internet website reached by Host
+        val upstreamServer = ServerSocket(0, 10, InetAddress.getByName("127.0.0.1"))
+        val upstreamPort = upstreamServer.localPort
+        val upstreamJob = scope.launch(Dispatchers.IO) {
+            runCatching {
+                val sock = upstreamServer.accept()
+                sock.use { s ->
+                    val reader = BufferedReader(InputStreamReader(s.getInputStream()))
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        if (line.isEmpty()) break
+                    }
+                    val body = "WIFISHARE_TUNNEL_HTTP_OK"
+                    val resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n$body"
+                    s.getOutputStream().write(resp.toByteArray(Charsets.US_ASCII))
+                    s.getOutputStream().flush()
+                }
+            }
+        }
+
+        val pendingDeferred = CompletableDeferred<com.example.model.PendingJoinRequest>()
+        val muxDeferred = CompletableDeferred<LocalTunnelStreamMux>()
+
+        val server = DirectHostGatewayServer(
+            sharingCode = code,
+            hostDisplayName = "HTTP Forwarder Host",
+            networkType = "WIFI",
+            hostPublicKeyB64 = TunnelCrypto.encodePublicKey(hostKp.public),
+            stunEndpoint = "direct",
+            permittedModesProvider = { SharingMode.entries.toSet() },
+            maxDevicesProvider = { 4 },
+            activeDevicesCountProvider = { 0 },
+            expiresAtEpochSec = (System.currentTimeMillis() / 1000L) + 600L,
+            scope = scope,
+            onJoinRequested = { req -> pendingDeferred.complete(req) },
+            onPendingClosed = {},
+            onServerError = {}
+        )
+
+        val port = server.start(0).getOrThrow()
+        val connector = DirectClientConnector(
+            hostIp = "127.0.0.1",
+            hostPort = port,
+            sharingCode = code,
+            deviceUuid = "http-client-1",
+            deviceName = "Browser Client",
+            clientPublicKeyB64 = TunnelCrypto.encodePublicKey(clientKp.public),
+            requestedMode = SharingMode.BROWSER_ONLY,
+            stunEndpoint = "direct",
+            scope = scope
+        )
+
+        var hostForwarder: HostGatewayForwarder? = null
+        var clientMux: LocalTunnelStreamMux? = null
+        try {
+            val clientJob = scope.launch(Dispatchers.IO) {
+                connector.connectAndAwaitApproval(
+                    onAwaitingApproval = {},
+                    onRejected = { reason -> muxDeferred.completeExceptionally(AssertionError(reason)) },
+                    onApproved = { hostInfo, _, createTransport ->
+                        val cipher = TunnelCrypto.deriveSessionCipher(
+                            localKeyPair = clientKp,
+                            remotePublicKeyB64 = hostInfo.hostPublicKeyB64,
+                            sessionSalt = code.toByteArray(Charsets.UTF_8),
+                            isHost = false
+                        )
+                        var localMux: LocalTunnelStreamMux? = null
+                        val transport = createTransport(cipher, TrafficAccounting(), { frame ->
+                            localMux?.onFrameReceived(frame)
+                        }, {})
+                        localMux = LocalTunnelStreamMux(cipher, transport, scope).also {
+                            it.startLocalProxy()
+                            muxDeferred.complete(it)
+                        }
+                    },
+                    onError = { err -> muxDeferred.completeExceptionally(err) }
+                )
+            }
+
+            val req = withTimeout(5_000L) { pendingDeferred.await() }
+            val hostCipher = TunnelCrypto.deriveSessionCipher(
+                localKeyPair = hostKp,
+                remotePublicKeyB64 = req.clientPublicKeyB64,
+                sessionSalt = code.toByteArray(Charsets.UTF_8),
+                isHost = true
+            )
+            var forwarderRef: HostGatewayForwarder? = null
+            val hostTransport = server.approvePendingClient(
+                connectionId = req.connectionId,
+                assignedIp = "10.88.0.2",
+                cipher = hostCipher,
+                accounting = TrafficAccounting(),
+                onFrameReceived = { frame -> forwarderRef?.handleIncomingFrame(frame) },
+                onTransportError = {}
+            ).getOrThrow()
+
+            hostForwarder = HostGatewayForwarder(
+                clientLabel = req.clientName,
+                cipher = hostCipher,
+                transport = hostTransport,
+                accounting = TrafficAccounting(),
+                activeNetworkProvider = { null },
+                scope = scope,
+                onClientDisconnected = {},
+                allowLoopbackUpstream = true
+            ).also { forwarderRef = it }
+
+            clientMux = withTimeout(5_000L) { muxDeferred.await() }
+            val httpClient = clientMux.createTunnelOkHttpClient()
+            val responseText = withTimeout(5_000L) {
+                val httpReq = Request.Builder().url("http://127.0.0.1:$upstreamPort/hello").build()
+                httpClient.newCall(httpReq).execute().use { resp ->
+                    assertEquals(200, resp.code)
+                    resp.body?.string().orEmpty()
+                }
+            }
+            assertEquals("WIFISHARE_TUNNEL_HTTP_OK", responseText)
+
+            hostTransport.close()
+            clientJob.cancel()
+        } finally {
+            clientMux?.close()
+            hostForwarder?.close()
+            connector.cancel()
+            server.stop()
+            runCatching { upstreamServer.close() }
+            upstreamJob.cancel()
             scope.cancel()
         }
     }

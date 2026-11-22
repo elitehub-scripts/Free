@@ -34,6 +34,8 @@ class OfflineWifiDirectManager(
         runCatching { appContext.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager }.getOrNull()
     private var channel: WifiP2pManager.Channel? = null
     private var receiverRegistered = false
+    @Volatile
+    private var lastGroupCreatedAtMs: Long = 0L
 
     private val _state = MutableStateFlow(
         OfflineP2pState(
@@ -42,6 +44,10 @@ class OfflineWifiDirectManager(
         )
     )
     val state: StateFlow<OfflineP2pState> = _state.asStateFlow()
+
+    init {
+        ensureChannelAndReceiver()
+    }
 
     private val receiver = object : BroadcastReceiver() {
         @SuppressLint("MissingPermission")
@@ -103,6 +109,11 @@ class OfflineWifiDirectManager(
                                     onGroupConnectionUpdated(info.isGroupOwner, ownerIp)
                                 }
                             } else {
+                                // Ignore stale sticky disconnection broadcast within 4s of createGroup()
+                                val elapsedSinceCreate = System.currentTimeMillis() - lastGroupCreatedAtMs
+                                if (_state.value.isGroupOwner && elapsedSinceCreate < 4_000L) {
+                                    return@requestConnectionInfo
+                                }
                                 _state.value = _state.value.copy(
                                     isGroupActive = false,
                                     isGroupOwner = false,
@@ -149,6 +160,7 @@ class OfflineWifiDirectManager(
         _state.value = _state.value.copy(statusMessage = "Creating offline Wi-Fi Direct group...")
         mgr.createGroup(ch, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
+                lastGroupCreatedAtMs = System.currentTimeMillis()
                 mgr.requestGroupInfo(ch) { grp ->
                     _state.value = _state.value.copy(
                         isGroupActive = true,

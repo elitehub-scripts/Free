@@ -1,6 +1,7 @@
 package com.example.networking.transport
 
 import android.util.Log
+import com.example.model.DiscoveredHostPeer
 import com.example.model.HostPublicInfo
 import com.example.model.PendingJoinRequest
 import com.example.model.SharingMode
@@ -35,6 +36,8 @@ private const val OP_JOIN_PENDING: Int = 0x11
 private const val OP_JOIN_APPROVED: Int = 0x12
 private const val OP_JOIN_REJECTED: Int = 0x13
 private const val OP_KEEPALIVE: Int = 0x14
+private const val OP_DISCOVER_REQ: Int = 0x15
+private const val OP_DISCOVER_RESP: Int = 0x16
 
 private val controlJson = Json { ignoreUnknownKeys = true }
 
@@ -74,6 +77,16 @@ data class DirectJoinApprovedPayload(
 @Serializable
 data class DirectJoinRejectedPayload(
     val reason: String
+)
+
+@Serializable
+data class DirectDiscoverResponsePayload(
+    val sharingCode: String,
+    val hostName: String,
+    val port: Int,
+    val networkType: String,
+    val hostPublicKey: String,
+    val permittedModes: List<String>
 )
 
 /**
@@ -199,7 +212,8 @@ class DirectHostGatewayServer(
     private val trustedDeviceUuidsProvider: () -> Set<String> = { emptySet() },
     private val onAutoApproveRequested: ((PendingJoinRequest) -> Unit)? = null,
     private val networkTypeProvider: () -> String = { networkType },
-    private val allowOpenOfflineRequestsProvider: () -> Boolean = { true }
+    private val allowOpenOfflineRequestsProvider: () -> Boolean = { true },
+    private val autoAcceptOpenRequestsProvider: () -> Boolean = { false }
 ) {
     private class PendingSocketEntry(
         val connectionId: Long,
@@ -266,6 +280,19 @@ class DirectHostGatewayServer(
 
             val op = inp.readByte().toInt() and 0xFF
             val len = inp.readInt()
+            if (op == OP_DISCOVER_REQ) {
+                val resp = DirectDiscoverResponsePayload(
+                    sharingCode = sharingCode,
+                    hostName = hostDisplayName,
+                    port = actualListenPort,
+                    networkType = networkTypeProvider(),
+                    hostPublicKey = hostPublicKeyB64,
+                    permittedModes = permittedModesProvider().map { it.code }
+                )
+                sendControlFrame(out, OP_DISCOVER_RESP, controlJson.encodeToString(resp).toByteArray(Charsets.UTF_8))
+                socket.close()
+                return
+            }
             if (op != OP_JOIN_REQUEST || len <= 0 || len > 32_768) {
                 sendRejection(out, "Invalid WiFiShare handshake frame.")
                 socket.close()
@@ -362,7 +389,9 @@ class DirectHostGatewayServer(
 
             pendingSockets[connId] = PendingSocketEntry(connId, socket, inp, out, pendingReq, keepaliveJob)
             val isTrustedClient = req.deviceUuid in trustedDeviceUuidsProvider()
-            if (autoAcceptTrustedProvider() && isTrustedClient && onAutoApproveRequested != null) {
+            val shouldAutoAccept = autoAcceptOpenRequestsProvider() ||
+                (autoAcceptTrustedProvider() && isTrustedClient)
+            if (shouldAutoAccept && onAutoApproveRequested != null) {
                 onAutoApproveRequested.invoke(pendingReq)
             } else {
                 onJoinRequested(pendingReq)
@@ -612,5 +641,46 @@ class DirectClientConnector(
                 onError(e)
             }
         }
+    }
+}
+
+object DirectTcpProbe {
+    suspend fun probeHost(
+        hostIp: String,
+        hostPort: Int,
+        timeoutMs: Int = 280
+    ): DiscoveredHostPeer? = withContext(Dispatchers.IO) {
+        if (hostIp.isBlank() || hostIp == "—" || hostPort !in 1..65535) return@withContext null
+        runCatching {
+            Socket().use { socket ->
+                socket.connect(InetSocketAddress(InetAddress.getByName(hostIp), hostPort), timeoutMs)
+                socket.soTimeout = timeoutMs + 300
+                val out = DataOutputStream(socket.getOutputStream())
+                val inp = DataInputStream(socket.getInputStream())
+                out.writeByte(OP_DISCOVER_REQ)
+                out.writeInt(0)
+                out.flush()
+
+                val op = inp.readByte().toInt() and 0xFF
+                val len = inp.readInt()
+                if (op != OP_DISCOVER_RESP || len <= 0 || len > 32_768) return@use null
+                val bytes = ByteArray(len)
+                inp.readFully(bytes)
+                val info = controlJson.decodeFromString<DirectDiscoverResponsePayload>(String(bytes, Charsets.UTF_8))
+                val modes = info.permittedModes.mapNotNull { code ->
+                    SharingMode.entries.firstOrNull { it.code == code }
+                }.toSet().ifEmpty { SharingMode.entries.toSet() }
+                DiscoveredHostPeer(
+                    serviceName = info.sharingCode,
+                    sharingCode = info.sharingCode.uppercase(),
+                    hostName = info.hostName.ifBlank { "WiFiShare Host" },
+                    hostIp = hostIp,
+                    hostPort = info.port.takeIf { it > 0 } ?: hostPort,
+                    hostPublicKeyB64 = info.hostPublicKey,
+                    networkType = info.networkType,
+                    permittedModes = modes
+                )
+            }
+        }.getOrNull()
     }
 }

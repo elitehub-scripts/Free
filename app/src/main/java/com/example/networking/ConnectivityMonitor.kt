@@ -46,12 +46,45 @@ class ConnectivityMonitor(context: Context) {
         _networkInfo.value = readCurrentNetworkInfo()
     }
 
+    @Suppress("DEPRECATION")
     fun getActivePhysicalNetwork(): Network? {
-        val active = cm.activeNetwork ?: return null
-        val caps = cm.getNetworkCapabilities(active) ?: return null
-        if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return null
-        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return null
-        return active
+        val active = cm.activeNetwork
+        if (active != null) {
+            val caps = cm.getNetworkCapabilities(active)
+            if (caps != null &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+            ) {
+                return active
+            }
+        }
+        val candidates = cm.allNetworks.filter { net ->
+            val caps = cm.getNetworkCapabilities(net) ?: return@filter false
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+        }
+        return candidates.firstOrNull { net ->
+            cm.getNetworkCapabilities(net)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+        } ?: candidates.firstOrNull()
+    }
+
+    fun getDefaultGatewayIp(): String? {
+        val active = cm.activeNetwork
+        val props = active?.let { cm.getLinkProperties(it) }
+        val routeGw = props?.routes
+            ?.firstOrNull { it.isDefaultRoute && it.gateway is Inet4Address && !it.gateway!!.isLoopbackAddress }
+            ?.gateway?.hostAddress
+        if (!routeGw.isNullOrBlank() && routeGw != "0.0.0.0") return routeGw
+
+        @Suppress("DEPRECATION")
+        for (net in cm.allNetworks) {
+            val lp = cm.getLinkProperties(net) ?: continue
+            val gw = lp.routes
+                .firstOrNull { it.isDefaultRoute && it.gateway is Inet4Address && !it.gateway!!.isLoopbackAddress }
+                ?.gateway?.hostAddress
+            if (!gw.isNullOrBlank() && gw != "0.0.0.0") return gw
+        }
+        return null
     }
 
     private fun readCurrentNetworkInfo(): ActiveNetworkInfo {

@@ -1,5 +1,7 @@
 package com.example.networking.transport
 
+import android.content.Context
+import android.net.wifi.WifiManager
 import android.util.Log
 import com.example.model.DiscoveredHostPeer
 import com.example.model.NearbyOfflineNeed
@@ -47,7 +49,13 @@ private data class OfflineNeedPacket(
  * - Port 51822: Host advertisement beacons -> Client discovery
  * - Port 51823: Client "I need internet offline" request beacons -> Host notification & direct reply
  */
-class LocalBeaconDiscovery(private val scope: CoroutineScope) {
+class LocalBeaconDiscovery(
+    private val scope: CoroutineScope,
+    context: Context? = null
+) {
+
+    private val wifiManager = context?.applicationContext?.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     private val json = Json { ignoreUnknownKeys = true }
     private var advertiserJob: Job? = null
@@ -63,6 +71,29 @@ class LocalBeaconDiscovery(private val scope: CoroutineScope) {
 
     private val _nearbyOfflineNeeds = MutableStateFlow<List<NearbyOfflineNeed>>(emptyList())
     val nearbyOfflineNeeds: StateFlow<List<NearbyOfflineNeed>> = _nearbyOfflineNeeds.asStateFlow()
+
+    private fun acquireMulticastLock() {
+        runCatching {
+            if (multicastLock == null) {
+                multicastLock = wifiManager?.createMulticastLock("wifishare_udp_beacon_lock")?.apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            } else if (multicastLock?.isHeld == false) {
+                multicastLock?.acquire()
+            }
+        }
+    }
+
+    private fun releaseMulticastLockIfIdle() {
+        if (listenerJob?.isActive != true && offlineNeedListenerJob?.isActive != true) {
+            runCatching {
+                if (multicastLock?.isHeld == true) {
+                    multicastLock?.release()
+                }
+            }
+        }
+    }
 
     fun startAdvertising(
         sharingCode: String,
@@ -93,7 +124,7 @@ class LocalBeaconDiscovery(private val scope: CoroutineScope) {
                             socket.send(DatagramPacket(bytes, bytes.size, target, BEACON_PORT))
                         }
                     }
-                    delay(2000)
+                    delay(1500)
                 }
             } catch (e: Exception) {
                 Log.d(TAG, "Beacon advertiser stopped: ${e.message}")
@@ -137,25 +168,25 @@ class LocalBeaconDiscovery(private val scope: CoroutineScope) {
 
     fun startListening() {
         stopListening()
+        acquireMulticastLock()
         _discoveredPeers.value = emptyList()
         listenerJob = scope.launch(Dispatchers.IO) {
             try {
                 val sock = DatagramSocket(null).apply {
                     reuseAddress = true
                     broadcast = true
-                    soTimeout = 2500
+                    soTimeout = 2000
                     bind(InetSocketAddress(BEACON_PORT))
                 }
                 listenSocket = sock
                 val buf = ByteArray(4096)
-                val localAddrs = collectOwnLocalAddresses()
 
                 while (isActive && !sock.isClosed) {
                     try {
                         val packet = DatagramPacket(buf, buf.size)
                         sock.receive(packet)
                         val senderIp = packet.address?.hostAddress ?: continue
-                        if (senderIp in localAddrs) continue
+                        if (senderIp in collectOwnLocalAddresses()) continue
 
                         val raw = String(packet.data, 0, packet.length, Charsets.UTF_8)
                         val beacon = runCatching { json.decodeFromString<OfflineBeaconPacket>(raw) }.getOrNull() ?: continue
@@ -184,6 +215,7 @@ class LocalBeaconDiscovery(private val scope: CoroutineScope) {
             } finally {
                 runCatching { listenSocket?.close() }
                 listenSocket = null
+                releaseMulticastLockIfIdle()
             }
         }
     }
@@ -193,13 +225,15 @@ class LocalBeaconDiscovery(private val scope: CoroutineScope) {
         listenerJob = null
         runCatching { listenSocket?.close() }
         listenSocket = null
+        releaseMulticastLockIfIdle()
     }
 
     fun startBroadcastingOfflineNeed(
         deviceUuid: String,
         deviceName: String,
         requestedMode: SharingMode,
-        note: String
+        note: String,
+        unicastTargetsProvider: () -> List<String> = { emptyList() }
     ) {
         stopBroadcastingOfflineNeed()
         offlineNeedBroadcasterJob = scope.launch(Dispatchers.IO) {
@@ -214,13 +248,18 @@ class LocalBeaconDiscovery(private val scope: CoroutineScope) {
                         note = note.take(120)
                     )
                     val bytes = json.encodeToString(pkt).toByteArray(Charsets.UTF_8)
-                    val targets = collectBroadcastTargets()
+                    val targets = collectBroadcastTargets().toMutableSet()
+                    unicastTargetsProvider().forEach { ip ->
+                        if (ip.isNotBlank()) {
+                            runCatching { targets.add(InetAddress.getByName(ip)) }
+                        }
+                    }
                     for (target in targets) {
                         runCatching {
                             socket.send(DatagramPacket(bytes, bytes.size, target, OFFLINE_REQUEST_PORT))
                         }
                     }
-                    delay(2000)
+                    delay(1500)
                 }
             } catch (e: Exception) {
                 Log.d(TAG, "Offline need broadcaster stopped: ${e.message}")
@@ -237,18 +276,18 @@ class LocalBeaconDiscovery(private val scope: CoroutineScope) {
 
     fun startListeningForOfflineNeeds(onNeedReceived: (NearbyOfflineNeed, InetAddress) -> Unit) {
         stopListeningForOfflineNeeds()
+        acquireMulticastLock()
         _nearbyOfflineNeeds.value = emptyList()
         offlineNeedListenerJob = scope.launch(Dispatchers.IO) {
             try {
                 val sock = DatagramSocket(null).apply {
                     reuseAddress = true
                     broadcast = true
-                    soTimeout = 2500
+                    soTimeout = 2000
                     bind(InetSocketAddress(OFFLINE_REQUEST_PORT))
                 }
                 offlineNeedListenSocket = sock
                 val buf = ByteArray(4096)
-                val localAddrs = collectOwnLocalAddresses()
 
                 while (isActive && !sock.isClosed) {
                     try {
@@ -256,7 +295,7 @@ class LocalBeaconDiscovery(private val scope: CoroutineScope) {
                         sock.receive(packet)
                         val senderAddr = packet.address ?: continue
                         val senderIp = senderAddr.hostAddress ?: continue
-                        if (senderIp in localAddrs) continue
+                        if (senderIp in collectOwnLocalAddresses()) continue
 
                         val raw = String(packet.data, 0, packet.length, Charsets.UTF_8)
                         val needPkt = runCatching { json.decodeFromString<OfflineNeedPacket>(raw) }.getOrNull() ?: continue
@@ -274,7 +313,6 @@ class LocalBeaconDiscovery(private val scope: CoroutineScope) {
                             .filterNot { it.deviceUuid == need.deviceUuid } + need
                         onNeedReceived(need, senderAddr)
                     } catch (_: java.net.SocketTimeoutException) {
-                        // Prune needs older than 20 seconds
                         val cutoff = System.currentTimeMillis() - 20_000L
                         _nearbyOfflineNeeds.value = _nearbyOfflineNeeds.value.filter { it.seenAtMs >= cutoff }
                     }
@@ -284,6 +322,7 @@ class LocalBeaconDiscovery(private val scope: CoroutineScope) {
             } finally {
                 runCatching { offlineNeedListenSocket?.close() }
                 offlineNeedListenSocket = null
+                releaseMulticastLockIfIdle()
             }
         }
     }
@@ -294,6 +333,7 @@ class LocalBeaconDiscovery(private val scope: CoroutineScope) {
         runCatching { offlineNeedListenSocket?.close() }
         offlineNeedListenSocket = null
         _nearbyOfflineNeeds.value = emptyList()
+        releaseMulticastLockIfIdle()
     }
 
     private fun collectBroadcastTargets(): Set<InetAddress> {

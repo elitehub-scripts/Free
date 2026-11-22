@@ -36,6 +36,7 @@ import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.filled.WifiTethering
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -107,6 +108,9 @@ fun HostModeScreen(
     onUpdateMaxDevices: (Int) -> Unit,
     onUpdateAutoAcceptTrusted: (Boolean) -> Unit,
     onUpdateAllowOpenOfflineRequests: (Boolean) -> Unit,
+    onUpdateAutoAcceptOpenRequests: (Boolean) -> Unit,
+    onApproveRequest: (PendingJoinRequest, Boolean) -> Unit,
+    onRejectRequest: (PendingJoinRequest) -> Unit,
     onOpenSharingCode: () -> Unit,
     onOpenApprovals: () -> Unit,
     onOpenConnectedDevices: () -> Unit,
@@ -115,6 +119,7 @@ fun HostModeScreen(
     val context = LocalContext.current
     val semantic = LocalWiFiShareColors.current
     val isHostActive = (tunnelState as? TunnelState.Connected)?.role == "HOST"
+    val isStartingHost = tunnelState is TunnelState.Handshaking
     var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var permissionHint by remember { mutableStateOf<String?>(null) }
 
@@ -186,9 +191,36 @@ fun HostModeScreen(
                                 label = when {
                                     isHostActive && isHostServiceRunning -> "BG SHARING ON"
                                     isHostActive -> "SHARING ON"
+                                    isStartingHost -> "STARTING..."
+                                    tunnelState is TunnelState.Error -> "ERROR"
                                     else -> "STOPPED"
                                 },
-                                color = if (isHostActive) semantic.success else MaterialTheme.colorScheme.onSurfaceVariant
+                                color = when {
+                                    isHostActive -> semantic.success
+                                    isStartingHost -> semantic.cyanAccent
+                                    tunnelState is TunnelState.Error -> MaterialTheme.colorScheme.error
+                                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
+                        }
+
+                        if (tunnelState is TunnelState.Handshaking) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                Text(
+                                    text = tunnelState.stage,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = semantic.cyanAccent
+                                )
+                            }
+                        } else if (tunnelState is TunnelState.Error) {
+                            Text(
+                                text = "${tunnelState.message} ${tunnelState.recoveryHint}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
                             )
                         }
 
@@ -204,36 +236,128 @@ fun HostModeScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Text(
-                                text = "Runs continuously in the background with notification Accept / Reject controls.",
+                                text = if (settings.autoAcceptOpenRequests) {
+                                    "Public Wi-Fi Share ON: Anyone nearby can connect & browse automatically."
+                                } else {
+                                    "Runs continuously in the background with notification Accept / Reject controls."
+                                },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = semantic.success
                             )
                         }
 
                         Button(
-                            onClick = if (isHostActive) onStopSharing else onStartSharing,
+                            onClick = if (isHostActive || isStartingHost) onStopSharing else onStartSharing,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(52.dp)
                                 .testTag("host_start_stop_button"),
                             shape = RoundedCornerShape(14.dp),
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = if (isHostActive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
-                                contentColor = if (isHostActive) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.onPrimary
+                                containerColor = if (isHostActive || isStartingHost) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                                contentColor = if (isHostActive || isStartingHost) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.onPrimary
                             )
                         ) {
                             Icon(
-                                imageVector = if (isHostActive) Icons.Default.StopCircle else Icons.Default.WifiTethering,
+                                imageVector = if (isHostActive || isStartingHost) Icons.Default.StopCircle else Icons.Default.WifiTethering,
                                 contentDescription = null
                             )
                             Spacer(Modifier.size(8.dp))
                             Text(
                                 when {
                                     isHostActive -> "Stop Sharing Immediately"
+                                    isStartingHost -> "Cancel Starting"
                                     networkInfo.isConnected -> "Start Background Host Sharing"
                                     else -> "Start Offline Host & Accept Mode"
                                 }
                             )
+                        }
+                    }
+                }
+
+                // Inline Pending Connection Requests (1-tap Accept / Reject right on Host dashboard)
+                if (pendingRequests.isNotEmpty()) {
+                    GlassCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        borderColor = semantic.warning.copy(alpha = 0.65f)
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Incoming Connection Requests", style = MaterialTheme.typography.titleMedium)
+                                StatusPill("${pendingRequests.size} WAITING", semantic.warning)
+                            }
+                            pendingRequests.forEach { req ->
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f))
+                                        .padding(10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(req.clientName, style = MaterialTheme.typography.titleSmall)
+                                        if (req.isOfflineRequest) {
+                                            StatusPill("OFFLINE REQ", semantic.warning)
+                                        }
+                                    }
+                                    Text(
+                                        "${req.requestedMode.label} • ${req.clientEndpoint}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = semantic.cyanAccent
+                                    )
+                                    if (req.requestNote.isNotBlank()) {
+                                        Text(
+                                            "\"${req.requestNote}\"",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        OutlinedButton(
+                                            onClick = { onRejectRequest(req) },
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .testTag("host_inline_reject_${req.connectionId}")
+                                        ) {
+                                            Icon(Icons.Default.Close, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(Modifier.size(4.dp))
+                                            Text("Reject")
+                                        }
+                                        Button(
+                                            onClick = { onApproveRequest(req, false) },
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .testTag("host_inline_approve_${req.connectionId}")
+                                        ) {
+                                            Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(Modifier.size(4.dp))
+                                            Text("Accept")
+                                        }
+                                    }
+                                    OutlinedButton(
+                                        onClick = { onApproveRequest(req, true) },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .testTag("host_inline_trust_${req.connectionId}")
+                                    ) {
+                                        Icon(Icons.Default.VerifiedUser, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.size(6.dp))
+                                        Text("Trust & Accept Offline")
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -367,6 +491,12 @@ fun HostModeScreen(
                             checked = settings.allowOpenOfflineRequests,
                             onCheckedChange = onUpdateAllowOpenOfflineRequests,
                             switchTestTag = "host_allow_open_offline_switch"
+                        )
+                        ModeSwitchRow(
+                            title = "Auto-Accept Anyone Nearby (Public Wi-Fi Share)",
+                            checked = settings.autoAcceptOpenRequests,
+                            onCheckedChange = onUpdateAutoAcceptOpenRequests,
+                            switchTestTag = "host_auto_accept_open_switch"
                         )
 
                         Spacer(Modifier.height(4.dp))

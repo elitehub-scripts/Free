@@ -131,7 +131,6 @@ class WiFiShareVpnService : VpnService() {
         if (VpnRuntimeBridge.ipv6Enabled) {
             runCatching {
                 builder.addAddress("fd88:5746::2", 64)
-                builder.addRoute("::", 0)
             }
         }
         // Exclude WiFiShare itself so underlying encrypted tunnel sockets never loop back into TUN

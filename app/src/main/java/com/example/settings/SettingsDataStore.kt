@@ -47,7 +47,8 @@ data class WiFiShareSettings(
     val ipv6Enabled: Boolean = true,
     val notificationsEnabled: Boolean = true,
     val autoAcceptTrustedPeers: Boolean = true,
-    val allowOpenOfflineRequests: Boolean = true
+    val allowOpenOfflineRequests: Boolean = true,
+    val autoAcceptOpenRequests: Boolean = false
 )
 
 class SettingsDataStore(private val context: Context) {
@@ -80,7 +81,8 @@ class SettingsDataStore(private val context: Context) {
             ipv6Enabled = prefs[KEY_IPV6_ENABLED] ?: true,
             notificationsEnabled = prefs[KEY_NOTIFICATIONS] ?: true,
             autoAcceptTrustedPeers = prefs[KEY_AUTO_ACCEPT_TRUSTED] ?: true,
-            allowOpenOfflineRequests = prefs[KEY_ALLOW_OPEN_OFFLINE_REQUESTS] ?: true
+            allowOpenOfflineRequests = prefs[KEY_ALLOW_OPEN_OFFLINE_REQUESTS] ?: true,
+            autoAcceptOpenRequests = prefs[KEY_AUTO_ACCEPT_OPEN_REQUESTS] ?: false
         )
     }
 
@@ -118,6 +120,7 @@ class SettingsDataStore(private val context: Context) {
     suspend fun setNotificationsEnabled(enabled: Boolean) = update { it[KEY_NOTIFICATIONS] = enabled }
     suspend fun setAutoAcceptTrustedPeers(enabled: Boolean) = update { it[KEY_AUTO_ACCEPT_TRUSTED] = enabled }
     suspend fun setAllowOpenOfflineRequests(enabled: Boolean) = update { it[KEY_ALLOW_OPEN_OFFLINE_REQUESTS] = enabled }
+    suspend fun setAutoAcceptOpenRequests(enabled: Boolean) = update { it[KEY_AUTO_ACCEPT_OPEN_REQUESTS] = enabled }
 
     private suspend fun update(block: (androidx.datastore.preferences.core.MutablePreferences) -> Unit) {
         context.wifiShareDataStore.edit(block)
@@ -147,5 +150,6 @@ class SettingsDataStore(private val context: Context) {
         private val KEY_NOTIFICATIONS = booleanPreferencesKey("notifications_enabled")
         private val KEY_AUTO_ACCEPT_TRUSTED = booleanPreferencesKey("auto_accept_trusted_peers")
         private val KEY_ALLOW_OPEN_OFFLINE_REQUESTS = booleanPreferencesKey("allow_open_offline_requests")
+        private val KEY_AUTO_ACCEPT_OPEN_REQUESTS = booleanPreferencesKey("auto_accept_open_requests")
     }
 }

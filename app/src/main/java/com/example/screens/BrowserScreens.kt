@@ -353,10 +353,33 @@ fun BrowserScreen(
                                         }
                                         val resp = tunnelClient.newCall(okReqBuilder.build()).execute()
                                         val contentType = resp.header("Content-Type", "text/html; charset=utf-8") ?: "text/html"
-                                        val mime = contentType.substringBefore(";").trim()
-                                        val charset = contentType.substringAfter("charset=", "utf-8").trim()
+                                        val mime = contentType.substringBefore(";").trim().ifBlank { "text/html" }
+                                        val charset = contentType.substringAfter("charset=", "utf-8")
+                                            .substringBefore(";")
+                                            .trim()
+                                            .trim('"', '\'')
+                                            .ifBlank { "utf-8" }
                                         val bytes = resp.body?.bytes() ?: ByteArray(0)
-                                        WebResourceResponse(mime, charset, ByteArrayInputStream(bytes))
+                                        val safeCode = resp.code.takeIf { it in 100..599 } ?: 200
+                                        val reason = resp.message.ifBlank { "OK" }
+                                        val headerMap = LinkedHashMap<String, String>()
+                                        for (i in 0 until resp.headers.size) {
+                                            val name = resp.headers.name(i)
+                                            if (!name.equals("Content-Length", ignoreCase = true) &&
+                                                !name.equals("Content-Encoding", ignoreCase = true) &&
+                                                !name.equals("Transfer-Encoding", ignoreCase = true)
+                                            ) {
+                                                headerMap[name] = resp.headers.value(i)
+                                            }
+                                        }
+                                        WebResourceResponse(
+                                            mime,
+                                            charset,
+                                            safeCode,
+                                            reason,
+                                            headerMap,
+                                            ByteArrayInputStream(bytes)
+                                        )
                                     }.getOrElse { err ->
                                         val html = """
                                             <html><body style="background:#060D1A;color:#F1F6FF;font-family:sans-serif;padding:24px;">
@@ -364,7 +387,7 @@ fun BrowserScreen(
                                             <p>${err.localizedMessage ?: "Unable to fetch through Host tunnel."}</p>
                                             </body></html>
                                         """.trimIndent()
-                                        WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(html.toByteArray()))
+                                        WebResourceResponse("text/html", "utf-8", 502, "Bad Gateway", emptyMap(), ByteArrayInputStream(html.toByteArray()))
                                     }
                                 }
                                 return super.shouldInterceptRequest(view, request)

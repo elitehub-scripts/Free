@@ -11,6 +11,7 @@ import com.example.networking.transport.TunnelWireCodec
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.InputStream
@@ -34,7 +35,8 @@ class HostGatewayForwarder(
     private val accounting: TrafficAccounting,
     private val activeNetworkProvider: () -> Network?,
     private val scope: CoroutineScope,
-    private val onClientDisconnected: () -> Unit
+    private val onClientDisconnected: () -> Unit,
+    private val allowLoopbackUpstream: Boolean = false
 ) {
     private data class NatKey(
         val protocol: Int,
@@ -55,15 +57,19 @@ class HostGatewayForwarder(
         val remotePort: Int,
         var hostSeq: Long,
         var clientNextSeq: Long,
+        val outboundChannel: Channel<ByteArray> = Channel(Channel.UNLIMITED),
         @Volatile var socket: Socket? = null,
         @Volatile var out: OutputStream? = null,
-        var readerJob: Job? = null
+        var readerJob: Job? = null,
+        var writerJob: Job? = null
     )
 
     private class StreamProxySession(
-        val socket: Socket,
-        val out: OutputStream,
-        val readerJob: Job
+        val outboundQueue: Channel<ByteArray> = Channel(Channel.UNLIMITED),
+        @Volatile var socket: Socket? = null,
+        @Volatile var closed: Boolean = false,
+        var connectAndWriteJob: Job? = null,
+        var readerJob: Job? = null
     )
 
     private val udpNat = ConcurrentHashMap<NatKey, UdpNatEntry>()
@@ -92,11 +98,8 @@ class HostGatewayForwarder(
             }
             TunnelCrypto.FRAME_STREAM_DATA -> {
                 val session = streamProxies[frame.streamId] ?: return
-                runCatching {
-                    session.out.write(frame.payload)
-                    session.out.flush()
-                }.onFailure {
-                    closeStreamProxy(frame.streamId)
+                if (!session.closed) {
+                    session.outboundQueue.trySend(frame.payload)
                 }
             }
             TunnelCrypto.FRAME_STREAM_CLOSE -> {
@@ -109,27 +112,41 @@ class HostGatewayForwarder(
     }
 
     private fun openTcpStreamProxy(streamId: Int, host: String, port: Int) {
-        scope.launch(Dispatchers.IO) {
+        // Register session SYNCHRONOUSLY before returning so immediate FRAME_STREAM_DATA
+        // packets (such as TLS ClientHello) are buffered in order rather than dropped.
+        closeStreamProxy(streamId)
+        val session = StreamProxySession()
+        streamProxies[streamId] = session
+
+        session.connectAndWriteJob = scope.launch(Dispatchers.IO) {
             try {
-                // Block SSRF / host LAN access to loopback or private tunnel subnet
-                val resolved = InetAddress.getByName(host)
+                val net = activeNetworkProvider()
+                val resolved = runCatching { net?.getByName(host) }.getOrNull() ?: InetAddress.getByName(host)
                 val addrBytes = resolved.address
-                if (resolved.isLoopbackAddress || (addrBytes.size == 4 && IpPacketCodec.isIsolatedLocalAddress(addrBytes))) {
+                if (!allowLoopbackUpstream &&
+                    (resolved.isLoopbackAddress || (addrBytes.size == 4 && IpPacketCodec.isIsolatedLocalAddress(addrBytes)))
+                ) {
+                    closeStreamProxy(streamId)
                     sendStreamClose(streamId)
                     return@launch
                 }
 
-                val net = activeNetworkProvider()
                 val sock = net?.socketFactory?.createSocket() ?: Socket()
-                sock.connect(InetSocketAddress(resolved, port), 10000)
+                sock.connect(InetSocketAddress(resolved, port), 12_000)
                 sock.tcpNoDelay = true
+                if (session.closed) {
+                    runCatching { sock.close() }
+                    return@launch
+                }
+                session.socket = sock
+
                 val inp: InputStream = sock.getInputStream()
                 val out: OutputStream = sock.getOutputStream()
 
-                val job = scope.launch(Dispatchers.IO) {
+                session.readerJob = scope.launch(Dispatchers.IO) {
                     val buf = ByteArray(16384)
                     try {
-                        while (isActive) {
+                        while (isActive && !session.closed) {
                             val read = inp.read(buf)
                             if (read <= 0) break
                             val data = buf.copyOf(read)
@@ -142,9 +159,16 @@ class HostGatewayForwarder(
                         sendStreamClose(streamId)
                     }
                 }
-                streamProxies[streamId] = StreamProxySession(sock, out, job)
+
+                // Drain any buffered + future outbound frames strictly in FIFO order
+                for (chunk in session.outboundQueue) {
+                    if (session.closed || !isActive) break
+                    out.write(chunk)
+                    out.flush()
+                }
             } catch (e: Exception) {
-                Log.w(TAG, "Stream open failed for $host:$port (${e.message})")
+                Log.w(TAG, "Stream open/write failed for $host:$port (${e.message})")
+                closeStreamProxy(streamId)
                 sendStreamClose(streamId)
             }
         }
@@ -157,8 +181,11 @@ class HostGatewayForwarder(
 
     private fun closeStreamProxy(streamId: Int) {
         streamProxies.remove(streamId)?.let { session ->
-            session.readerJob.cancel()
-            runCatching { session.socket.close() }
+            session.closed = true
+            session.outboundQueue.close()
+            session.connectAndWriteJob?.cancel()
+            session.readerJob?.cancel()
+            runCatching { session.socket?.close() }
         }
     }
 
@@ -241,14 +268,15 @@ class HostGatewayForwarder(
             )
             tcpNat[key] = session
 
-            scope.launch(Dispatchers.IO) {
+            session.writerJob = scope.launch(Dispatchers.IO) {
                 try {
                     val net = activeNetworkProvider()
                     val sock = net?.socketFactory?.createSocket() ?: Socket()
                     sock.connect(InetSocketAddress(InetAddress.getByAddress(ip.dstIp), tcp.dstPort), 10000)
                     sock.tcpNoDelay = true
                     session.socket = sock
-                    session.out = sock.getOutputStream()
+                    val out = sock.getOutputStream()
+                    session.out = out
 
                     // Send SYN-ACK back to client TUN
                     val synAck = IpPacketCodec.buildIpv4TcpPacket(
@@ -299,6 +327,13 @@ class HostGatewayForwarder(
                             closeTcpNat(key)
                         }
                     }
+
+                    // Drain outbound payloads strictly in FIFO order
+                    for (data in session.outboundChannel) {
+                        if (!isActive) break
+                        out.write(data)
+                        out.flush()
+                    }
                 } catch (e: Exception) {
                     val rstPkt = IpPacketCodec.buildIpv4TcpPacket(
                         srcIp = session.remoteIp,
@@ -318,24 +353,21 @@ class HostGatewayForwarder(
 
         val session = tcpNat[key] ?: return
         if (tcp.payload.isNotEmpty()) {
-            val out = session.out ?: return
-            scope.launch(Dispatchers.IO) {
-                runCatching {
-                    out.write(tcp.payload)
-                    out.flush()
-                    session.clientNextSeq = (tcp.seqNum + tcp.payload.size.toLong()) and 0xFFFFFFFFL
-                    val ackPkt = IpPacketCodec.buildIpv4TcpPacket(
-                        srcIp = session.remoteIp,
-                        dstIp = session.clientIp,
-                        srcPort = session.remotePort,
-                        dstPort = session.clientPort,
-                        seqNum = session.hostSeq,
-                        ackNum = session.clientNextSeq,
-                        flags = IpPacketCodec.TCP_ACK
-                    )
-                    transport.sendEncrypted(cipher.seal(TunnelCrypto.FRAME_IP_PACKET, 0, ackPkt))
-                }.onFailure { closeTcpNat(key) }
+            // Skip already-acknowledged retransmitted segment payloads
+            if (tcp.seqNum == session.clientNextSeq || session.clientNextSeq == 0L) {
+                session.outboundChannel.trySend(tcp.payload)
+                session.clientNextSeq = (tcp.seqNum + tcp.payload.size.toLong()) and 0xFFFFFFFFL
             }
+            val ackPkt = IpPacketCodec.buildIpv4TcpPacket(
+                srcIp = session.remoteIp,
+                dstIp = session.clientIp,
+                srcPort = session.remotePort,
+                dstPort = session.clientPort,
+                seqNum = session.hostSeq,
+                ackNum = session.clientNextSeq,
+                flags = IpPacketCodec.TCP_ACK
+            )
+            transport.sendEncrypted(cipher.seal(TunnelCrypto.FRAME_IP_PACKET, 0, ackPkt))
         }
 
         if ((tcp.flags and IpPacketCodec.TCP_FIN) != 0) {
@@ -356,6 +388,8 @@ class HostGatewayForwarder(
 
     private fun closeTcpNat(key: NatKey) {
         tcpNat.remove(key)?.let { s ->
+            s.outboundChannel.close()
+            s.writerJob?.cancel()
             s.readerJob?.cancel()
             runCatching { s.socket?.close() }
         }
