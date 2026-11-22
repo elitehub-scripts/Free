@@ -79,6 +79,7 @@ import java.security.SecureRandom
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import javax.net.SocketFactory
 
 /**
  * Application-scoped runtime engine for WiFiShare.
@@ -237,6 +238,20 @@ class WiFiShareRuntime private constructor(context: Context) {
         runtimeScope.launch {
             activeNetwork.collect { net ->
                 syncHostNetworkChanges(net)
+            }
+        }
+        runtimeScope.launch {
+            offlineP2pState.collect { p2p ->
+                if ((_tunnelState.value as? TunnelState.Connected)?.role == "HOST") {
+                    refreshHostInviteAndP2pService(p2p)
+                }
+            }
+        }
+        runtimeScope.launch {
+            settings.collect {
+                if ((_tunnelState.value as? TunnelState.Connected)?.role == "HOST") {
+                    refreshHostInviteAndP2pService(offlineP2pState.value)
+                }
             }
         }
         startTelemetrySampler()
@@ -476,7 +491,10 @@ class WiFiShareRuntime private constructor(context: Context) {
                     code = sharingCode,
                     hostIp = advertiseIp,
                     port = listenPort,
-                    hostPublicKeyB64 = hostPubB64
+                    hostPublicKeyB64 = hostPubB64,
+                    p2pIp = p2p.groupOwnerIp.ifBlank { if (p2p.isGroupActive) "192.168.49.1" else "" },
+                    p2pSsid = p2p.groupSsid,
+                    p2pPassphrase = p2p.groupPassphrase
                 )
 
                 val dbSessionId = localRepo.recordHostSessionStart(
@@ -533,6 +551,22 @@ class WiFiShareRuntime private constructor(context: Context) {
                             "Nearby offline internet request from ${need.deviceName} (${need.senderIp}): ${need.note.ifBlank { need.requestedMode.label }}"
                         )
                     }
+                }
+
+                wifiDirectManager.registerHostP2pService(
+                    sharingCode = sharingCode,
+                    hostPort = listenPort,
+                    p2pSsid = p2p.groupSsid,
+                    p2pPassphrase = p2p.groupPassphrase,
+                    allowOpenOffline = cfg.allowOpenOfflineRequests,
+                    autoAcceptOpen = cfg.autoAcceptOpenRequests
+                )
+                // If completely offline without a router/Hotspot, auto-start an Offline Wi-Fi Direct group if permitted
+                if (!net.isConnected && !p2p.isGroupActive &&
+                    OfflineWifiDirectManager.hasRequiredPermission(appContext) &&
+                    wifiDirectManager.isWifiEnabled()
+                ) {
+                    wifiDirectManager.createOfflineGroup()
                 }
 
                 _sharingCodeState.value = SharingCodeState(
@@ -599,13 +633,44 @@ class WiFiShareRuntime private constructor(context: Context) {
         }
     }
 
+    private fun refreshHostInviteAndP2pService(p2p: OfflineP2pState) {
+        val curCode = _sharingCodeState.value
+        if (curCode.code.isBlank() || hostGatewayServer?.isRunning != true) return
+        val cfg = settings.value
+        val p2pIp = p2p.groupOwnerIp.ifBlank { if (p2p.isGroupActive) "192.168.49.1" else "" }
+        val updatedInvite = QrCodeGenerator.buildInviteUri(
+            code = curCode.code,
+            hostIp = curCode.listenHost.ifBlank { p2pIp.ifBlank { "127.0.0.1" } },
+            port = curCode.listenPort,
+            hostPublicKeyB64 = curCode.hostPublicKeyB64,
+            p2pIp = p2pIp,
+            p2pSsid = p2p.groupSsid,
+            p2pPassphrase = p2p.groupPassphrase
+        )
+        if (updatedInvite != curCode.inviteUri) {
+            _sharingCodeState.value = curCode.copy(
+                inviteUri = updatedInvite,
+                qrPayload = updatedInvite
+            )
+        }
+        wifiDirectManager.registerHostP2pService(
+            sharingCode = curCode.code,
+            hostPort = curCode.listenPort,
+            p2pSsid = p2p.groupSsid,
+            p2pPassphrase = p2p.groupPassphrase,
+            allowOpenOffline = cfg.allowOpenOfflineRequests,
+            autoAcceptOpen = cfg.autoAcceptOpenRequests
+        )
+    }
+
     private fun syncHostNetworkChanges(net: ActiveNetworkInfo) {
         val currentTunnel = _tunnelState.value as? TunnelState.Connected ?: return
         if (currentTunnel.role != "HOST") return
 
         HostServiceBridge.egressStatusLabel = if (net.isConnected) net.transport.name else "Offline Local"
         val curCode = _sharingCodeState.value
-        val p2pIp = wifiDirectManager.state.value.groupOwnerIp.takeIf { it.isNotBlank() }
+        val p2p = wifiDirectManager.state.value
+        val p2pIp = p2p.groupOwnerIp.takeIf { it.isNotBlank() }
         val updatedIp = net.localIp.takeIf { it != "—" && it.isNotBlank() } ?: p2pIp
 
         if (curCode.code.isNotBlank() && updatedIp != null && curCode.listenHost == "127.0.0.1") {
@@ -613,7 +678,10 @@ class WiFiShareRuntime private constructor(context: Context) {
                 code = curCode.code,
                 hostIp = updatedIp,
                 port = curCode.listenPort,
-                hostPublicKeyB64 = curCode.hostPublicKeyB64
+                hostPublicKeyB64 = curCode.hostPublicKeyB64,
+                p2pIp = p2p.groupOwnerIp.ifBlank { if (p2p.isGroupActive) "192.168.49.1" else "" },
+                p2pSsid = p2p.groupSsid,
+                p2pPassphrase = p2p.groupPassphrase
             )
             _sharingCodeState.value = curCode.copy(
                 listenHost = updatedIp,
@@ -636,18 +704,25 @@ class WiFiShareRuntime private constructor(context: Context) {
         connectivityMonitor.refresh()
         if (isOwner) {
             val curCode = _sharingCodeState.value
+            val p2p = wifiDirectManager.state.value
             val currentTunnel = _tunnelState.value as? TunnelState.Connected
-            if (currentTunnel?.role == "HOST" && curCode.code.isNotBlank() &&
-                (curCode.listenHost == "127.0.0.1" || curCode.listenHost.isBlank())
-            ) {
+            if (currentTunnel?.role == "HOST" && curCode.code.isNotBlank()) {
+                val hostIpToUse = if (curCode.listenHost == "127.0.0.1" || curCode.listenHost.isBlank()) {
+                    ownerIp
+                } else {
+                    curCode.listenHost
+                }
                 val invite = QrCodeGenerator.buildInviteUri(
                     code = curCode.code,
-                    hostIp = ownerIp,
+                    hostIp = hostIpToUse,
                     port = curCode.listenPort,
-                    hostPublicKeyB64 = curCode.hostPublicKeyB64
+                    hostPublicKeyB64 = curCode.hostPublicKeyB64,
+                    p2pIp = ownerIp,
+                    p2pSsid = p2p.groupSsid,
+                    p2pPassphrase = p2p.groupPassphrase
                 )
                 _sharingCodeState.value = curCode.copy(
-                    listenHost = ownerIp,
+                    listenHost = hostIpToUse,
                     inviteUri = invite,
                     qrPayload = invite,
                     stunEndpoint = "Offline Wi-Fi Direct ($ownerIp)"
@@ -655,6 +730,7 @@ class WiFiShareRuntime private constructor(context: Context) {
                 _tunnelState.value = currentTunnel.copy(
                     transportPath = "Wi-Fi Direct ($ownerIp:${curCode.listenPort})"
                 )
+                refreshHostInviteAndP2pService(p2p)
             }
             logEvent("INFO", "WiFiDirect", "Offline Wi-Fi Direct Group Owner active at $ownerIp")
         } else {
@@ -845,6 +921,7 @@ class WiFiShareRuntime private constructor(context: Context) {
         nsdDiscovery.unregisterHostService()
         beaconDiscovery.stopAdvertising()
         beaconDiscovery.stopListeningForOfflineNeeds()
+        wifiDirectManager.unregisterHostP2pService()
         hostGatewayServer?.stop()
         hostGatewayServer = null
 
@@ -920,9 +997,13 @@ class WiFiShareRuntime private constructor(context: Context) {
             addTarget(saved.hostIp, saved.hostPort.takeIf { it > 0 } ?: defaultPort)
         }
 
+        val priorityFactory = wifiDirectManager.getBoundP2pNetwork()?.socketFactory
         val priorityMatch = coroutineScope {
             priorityTargets.entries.map { (ip, port) ->
-                async { DirectTcpProbe.probeHost(ip, port, timeoutMs = 450) }
+                async {
+                    DirectTcpProbe.probeHost(ip, port, timeoutMs = 450, socketFactory = null)
+                        ?: priorityFactory?.let { DirectTcpProbe.probeHost(ip, port, timeoutMs = 450, socketFactory = it) }
+                }
             }.awaitAll().filterNotNull().also { list ->
                 list.forEach { addDiscoveredHost(it) }
             }.firstOrNull()
@@ -1026,6 +1107,40 @@ class WiFiShareRuntime private constructor(context: Context) {
 
             var targetIp = parsedInvite?.hostIp ?: manualHostIp.trim().takeIf { it.isNotBlank() }
             var targetPort = parsedInvite?.hostPort ?: manualHostPort
+            var targetSocketFactory: SocketFactory? = wifiDirectManager.getBoundP2pNetwork()?.socketFactory
+
+            // If invite has a LAN host IP AND P2P SoftAP credentials, test if LAN IP is actually reachable first;
+            // if client is offline (not on Host's router), automatically join Host's Wi-Fi Direct SoftAP via QR creds!
+            if (targetIp != null && !parsedInvite?.p2pSsid.isNullOrBlank() && !parsedInvite?.p2pPassphrase.isNullOrBlank()) {
+                val directReachable = DirectTcpProbe.probeHost(
+                    hostIp = targetIp,
+                    hostPort = targetPort ?: settings.value.directListenPort,
+                    timeoutMs = 1_100,
+                    socketFactory = targetSocketFactory
+                )
+                if (directReachable == null) {
+                    if (!wifiDirectManager.isWifiEnabled()) {
+                        stopClientForegroundService()
+                        _tunnelState.value = TunnelState.Error(
+                            "WIFI_OFF",
+                            "Wi-Fi is turned OFF on this phone.",
+                            "Turn ON Wi-Fi so this phone can join Host network \"${parsedInvite?.p2pSsid}\" offline."
+                        )
+                        return@launch
+                    }
+                    _tunnelState.value = TunnelState.Handshaking(
+                        "Joining Host's offline Wi-Fi Direct network (${parsedInvite?.p2pSsid})..."
+                    )
+                    val joinedNet = wifiDirectManager.joinWifiDirectAp(
+                        ssid = parsedInvite!!.p2pSsid!!,
+                        passphrase = parsedInvite.p2pPassphrase!!
+                    )
+                    if (joinedNet != null) {
+                        targetIp = parsedInvite.p2pIp?.ifBlank { "192.168.49.1" } ?: "192.168.49.1"
+                        targetSocketFactory = joinedNet.socketFactory
+                    }
+                }
+            }
 
             if (targetIp == null || targetPort == null) {
                 val match = discoveredHosts.value.firstOrNull { it.sharingCode.equals(code, ignoreCase = true) }
@@ -1037,6 +1152,9 @@ class WiFiShareRuntime private constructor(context: Context) {
                         nsdDiscovery.startDiscovery()
                     }
                     beaconDiscovery.startListening()
+                    if (OfflineWifiDirectManager.hasRequiredPermission(appContext) && wifiDirectManager.isWifiEnabled()) {
+                        wifiDirectManager.startPeerDiscovery()
+                    }
                     val tcpProbeDeferred = async { probeCandidateAndLanHosts(manualHostIp, manualHostPort) }
                     repeat(14) {
                         delay(250)
@@ -1045,6 +1163,18 @@ class WiFiShareRuntime private constructor(context: Context) {
                             targetIp = found.hostIp
                             targetPort = found.hostPort
                             return@repeat
+                        }
+                        val p2pSvc = wifiDirectManager.state.value.services
+                            .firstOrNull { it.sharingCode.equals(code, ignoreCase = true) }
+                        if (p2pSvc != null && p2pSvc.p2pSsid.isNotBlank() && p2pSvc.p2pPassphrase.isNotBlank()) {
+                            _tunnelState.value = TunnelState.Handshaking("Found Host over P2P (${p2pSvc.deviceName}). Joining offline Wi-Fi...")
+                            val joinedNet = wifiDirectManager.joinWifiDirectAp(p2pSvc.p2pSsid, p2pSvc.p2pPassphrase)
+                            if (joinedNet != null) {
+                                targetIp = p2pSvc.p2pIp.ifBlank { "192.168.49.1" }
+                                targetPort = p2pSvc.hostPort
+                                targetSocketFactory = joinedNet.socketFactory
+                                return@repeat
+                            }
                         }
                     }
                     if (targetIp == null || targetPort == null) {
@@ -1065,6 +1195,7 @@ class WiFiShareRuntime private constructor(context: Context) {
                 val p2pOwnerIp = wifiDirectManager.state.value.groupOwnerIp.takeIf { it.isNotBlank() }
                 if (p2pOwnerIp != null) {
                     targetIp = p2pOwnerIp
+                    targetSocketFactory = wifiDirectManager.getBoundP2pNetwork()?.socketFactory ?: targetSocketFactory
                 }
             }
 
@@ -1083,7 +1214,7 @@ class WiFiShareRuntime private constructor(context: Context) {
                 _tunnelState.value = TunnelState.Error(
                     "HOST_ENDPOINT_NEEDED",
                     "No Host IP address found for code $code.",
-                    "Scan the Host's QR code, connect via Hotspot/Wi-Fi Direct, or enter the Host IP & Port."
+                    "Turn on Wi-Fi and scan Host's QR code, or connect to Host's Hotspot / Wi-Fi Direct first."
                 )
                 return@launch
             }
@@ -1093,15 +1224,16 @@ class WiFiShareRuntime private constructor(context: Context) {
                 resolvedPort = resolvedPort,
                 code = code,
                 isOfflineRequest = false,
-                requestNote = ""
+                requestNote = "",
+                socketFactory = targetSocketFactory
             )
         }
     }
 
     /**
      * Allows an offline Client with no sharing code to broadcast an offline internet request beacon,
-     * discover any nearby Host (via UDP Beacon, mDNS, Wi-Fi Direct, gateway/LAN TCP probe, or manual IP),
-     * and submit an open join request directly to that Host for authorization.
+     * discover any nearby Host (via UDP Beacon, mDNS, Wi-Fi Direct DNS-SD/Peers, gateway/LAN TCP probe, or manual IP),
+     * auto-join the Host's offline Wi-Fi Direct AP when needed, and submit an open join request directly for authorization.
      */
     fun requestInternetOffline(
         note: String = "",
@@ -1136,12 +1268,29 @@ class WiFiShareRuntime private constructor(context: Context) {
         startClientForegroundService()
 
         clientConnectJob = runtimeScope.launch {
-            _tunnelState.value = TunnelState.Handshaking("Searching Wi-Fi, Hotspot & P2P for nearby WiFiShare Hosts...")
+            connectivityMonitor.refresh()
+            val curNet = activeNetwork.value
+            if (!curNet.isConnected && !curNet.hasLocalLink &&
+                !wifiDirectManager.isWifiEnabled() && manualHostIp.isBlank()
+            ) {
+                stopClientForegroundService()
+                _tunnelState.value = TunnelState.Error(
+                    "WIFI_OFF",
+                    "Wi-Fi is turned OFF on this phone.",
+                    "Turn ON Wi-Fi (no internet or router required) so this phone can discover & join a nearby Host offline."
+                )
+                return@launch
+            }
+
+            _tunnelState.value = TunnelState.Handshaking("Searching Wi-Fi, Hotspot & Wi-Fi Direct for nearby Hosts...")
 
             if (settings.value.enableNsdDiscovery && !isNsdScanning.value) {
                 nsdDiscovery.startDiscovery()
             }
             beaconDiscovery.startListening()
+            if (OfflineWifiDirectManager.hasRequiredPermission(appContext) && wifiDirectManager.isWifiEnabled()) {
+                wifiDirectManager.startPeerDiscovery()
+            }
             beaconDiscovery.startBroadcastingOfflineNeed(
                 deviceUuid = deviceUuid,
                 deviceName = deviceName,
@@ -1158,11 +1307,14 @@ class WiFiShareRuntime private constructor(context: Context) {
                 }
             )
 
-            logEvent("INFO", "Client", "Started offline internet request broadcast (${cleanNote.ifBlank { _clientSelectedMode.value.label }})")
+            logEvent("INFO", "Client", "Started offline internet request (${cleanNote.ifBlank { _clientSelectedMode.value.label }})")
 
             var targetIp: String? = null
             var targetPort: Int? = null
             var targetCode: String = DirectHostGatewayServer.OFFLINE_REQUEST_CODE
+            var targetSocketFactory: SocketFactory? = wifiDirectManager.getBoundP2pNetwork()?.socketFactory
+            var attemptedSoftApSsid = ""
+            var attemptedP2pPeerConnect = false
 
             for (attempt in 0 until 60) {
                 if (!isActive || manualClientDisconnect) {
@@ -1186,12 +1338,57 @@ class WiFiShareRuntime private constructor(context: Context) {
                     break
                 }
 
-                val p2pIp = wifiDirectManager.state.value.groupOwnerIp.takeIf { it.isNotBlank() }
-                if (p2pIp != null && attempt >= 1) {
-                    targetIp = p2pIp
-                    targetPort = manualHostPort ?: settings.value.directListenPort
-                    targetCode = DirectHostGatewayServer.OFFLINE_REQUEST_CODE
-                    break
+                val p2pState = wifiDirectManager.state.value
+                val p2pIp = p2pState.groupOwnerIp.takeIf { it.isNotBlank() }
+                if (p2pIp != null && p2pState.isGroupActive && !p2pState.isGroupOwner) {
+                    val p2pNet = wifiDirectManager.getBoundP2pNetwork()
+                    val probedP2p = DirectTcpProbe.probeHost(
+                        hostIp = p2pIp,
+                        hostPort = manualHostPort ?: settings.value.directListenPort,
+                        timeoutMs = 700,
+                        socketFactory = p2pNet?.socketFactory
+                    ) ?: DirectTcpProbe.probeHost(
+                        hostIp = p2pIp,
+                        hostPort = manualHostPort ?: settings.value.directListenPort,
+                        timeoutMs = 700
+                    )
+                    if (probedP2p != null) {
+                        targetIp = probedP2p.hostIp
+                        targetPort = probedP2p.hostPort
+                        targetCode = probedP2p.sharingCode.ifBlank { DirectHostGatewayServer.OFFLINE_REQUEST_CODE }
+                        targetSocketFactory = p2pNet?.socketFactory
+                        break
+                    }
+                }
+
+                // Check discovered Wi-Fi Direct WiFiShare services with SoftAP credentials
+                val p2pSvc = p2pState.services.firstOrNull {
+                    it.allowOpenOffline && it.p2pSsid.isNotBlank() && it.p2pPassphrase.isNotBlank()
+                }
+                if (p2pSvc != null && attemptedSoftApSsid != p2pSvc.p2pSsid) {
+                    attemptedSoftApSsid = p2pSvc.p2pSsid
+                    _tunnelState.value = TunnelState.Handshaking(
+                        "Found Host ${p2pSvc.deviceName}. Joining offline Wi-Fi Direct AP (${p2pSvc.p2pSsid})..."
+                    )
+                    val joinedNet = wifiDirectManager.joinWifiDirectAp(p2pSvc.p2pSsid, p2pSvc.p2pPassphrase)
+                    if (joinedNet != null) {
+                        targetIp = p2pSvc.p2pIp.ifBlank { "192.168.49.1" }
+                        targetPort = p2pSvc.hostPort
+                        targetCode = p2pSvc.sharingCode.ifBlank { DirectHostGatewayServer.OFFLINE_REQUEST_CODE }
+                        targetSocketFactory = joinedNet.socketFactory
+                        break
+                    }
+                }
+
+                // If a Wi-Fi Direct service or peer was discovered without pre-shared SoftAP creds, connect P2P directly
+                if (!attemptedP2pPeerConnect && !p2pState.isGroupActive && attempt >= 2) {
+                    val targetPeerAddr = p2pState.services.firstOrNull { it.allowOpenOffline }?.deviceAddress
+                        ?: p2pState.peers.firstOrNull { it.statusLabel.contains("Available", ignoreCase = true) }?.deviceAddress
+                    if (!targetPeerAddr.isNullOrBlank()) {
+                        attemptedP2pPeerConnect = true
+                        _tunnelState.value = TunnelState.Handshaking("Connecting via Offline Wi-Fi Direct to nearby Host...")
+                        wifiDirectManager.connectToPeer(targetPeerAddr)
+                    }
                 }
 
                 // Immediately on attempt 0 and periodically thereafter, probe gateway, Hotspot/P2P IPs, and LAN subnet over TCP
@@ -1201,6 +1398,7 @@ class WiFiShareRuntime private constructor(context: Context) {
                         targetIp = tcpFound.hostIp
                         targetPort = tcpFound.hostPort
                         targetCode = tcpFound.sharingCode.ifBlank { DirectHostGatewayServer.OFFLINE_REQUEST_CODE }
+                        targetSocketFactory = wifiDirectManager.getBoundP2pNetwork()?.socketFactory ?: targetSocketFactory
                         break
                     }
                 }
@@ -1217,7 +1415,7 @@ class WiFiShareRuntime private constructor(context: Context) {
                 _tunnelState.value = TunnelState.Error(
                     "NO_OFFLINE_HOST_FOUND",
                     "No nearby WiFiShare Host responded to your offline request.",
-                    "Connect to the Host's Wi-Fi, Hotspot, or Wi-Fi Direct group with Host Sharing ON."
+                    "Ensure Wi-Fi is ON and the Host has Host Sharing active (with P2P Group, Hotspot, or same Wi-Fi)."
                 )
                 return@launch
             }
@@ -1227,7 +1425,8 @@ class WiFiShareRuntime private constructor(context: Context) {
                 resolvedPort = resolvedPort,
                 code = targetCode,
                 isOfflineRequest = true,
-                requestNote = cleanNote
+                requestNote = cleanNote,
+                socketFactory = targetSocketFactory
             )
         }
     }
@@ -1237,7 +1436,8 @@ class WiFiShareRuntime private constructor(context: Context) {
         resolvedPort: Int,
         code: String,
         isOfflineRequest: Boolean,
-        requestNote: String
+        requestNote: String,
+        socketFactory: SocketFactory? = wifiDirectManager.getBoundP2pNetwork()?.socketFactory
     ) {
         ClientServiceBridge.statusTitle = "Connecting to $resolvedIp:$resolvedPort..."
         _tunnelState.value = TunnelState.Handshaking(
@@ -1249,7 +1449,8 @@ class WiFiShareRuntime private constructor(context: Context) {
         val kp = TunnelCrypto.generateEphemeralKeyPair().also { ephemeralKeyPair = it }
         val clientPubB64 = TunnelCrypto.encodePublicKey(kp.public)
         val net = activeNetwork.value
-        val stunEndpoint = if (net.isConnected) {
+        val isPrivateLocalIp = resolvedIp.startsWith("192.168.") || resolvedIp.startsWith("10.") || resolvedIp.startsWith("172.")
+        val stunEndpoint = if (net.isConnected && !isPrivateLocalIp) {
             StunClient.discoverPublicEndpoint(cfg.stunHost, cfg.stunPort)
                 .getOrNull()?.let { "${it.publicIp}:${it.publicPort}" } ?: "direct"
         } else {
@@ -1267,7 +1468,8 @@ class WiFiShareRuntime private constructor(context: Context) {
             stunEndpoint = stunEndpoint,
             scope = runtimeScope,
             isOfflineRequest = isOfflineRequest,
-            requestNote = requestNote
+            requestNote = requestNote,
+            socketFactory = socketFactory
         )
         activeClientConnector = connector
 
@@ -1506,6 +1708,7 @@ class WiFiShareRuntime private constructor(context: Context) {
         activeClientConnector?.cancel()
         activeClientConnector = null
         beaconDiscovery.stopBroadcastingOfflineNeed()
+        wifiDirectManager.releaseSoftApNetwork()
         stopVpnOnly()
         stopClientForegroundService()
 

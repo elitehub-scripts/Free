@@ -59,6 +59,40 @@ class ExampleRobolectricTest {
     }
 
     @Test
+    fun `qr invite uri round-trips offline p2p softap credentials alongside lan ip`() {
+        val uri = QrCodeGenerator.buildInviteUri(
+            code = "WFS-M5ZW-GZ85",
+            hostIp = "192.168.1.5",
+            port = 51821,
+            hostPublicKeyB64 = "TESTKEY123==",
+            p2pIp = "192.168.49.1",
+            p2pSsid = "DIRECT-1v-TECNO SPARK Go 2",
+            p2pPassphrase = "nj9KZWfa"
+        )
+        val parsed = QrCodeGenerator.parseShareInvite(uri)
+        assertNotNull(parsed)
+        assertEquals("WFS-M5ZW-GZ85", parsed!!.code)
+        assertEquals("192.168.1.5", parsed.hostIp)
+        assertEquals(51821, parsed.hostPort)
+        assertEquals("TESTKEY123==", parsed.hostPublicKeyB64)
+        assertEquals("192.168.49.1", parsed.p2pIp)
+        assertEquals("DIRECT-1v-TECNO SPARK Go 2", parsed.p2pSsid)
+        assertEquals("nj9KZWfa", parsed.p2pPassphrase)
+
+        val legacyUri = QrCodeGenerator.buildInviteUri(
+            code = "WFS-OLD1-2233",
+            hostIp = "192.168.1.20",
+            port = 51821,
+            hostPublicKeyB64 = "LEGACY=="
+        )
+        val parsedLegacy = QrCodeGenerator.parseShareInvite(legacyUri)
+        assertNotNull(parsedLegacy)
+        assertEquals("WFS-OLD1-2233", parsedLegacy!!.code)
+        assertEquals(null, parsedLegacy.p2pSsid)
+        assertEquals(null, parsedLegacy.p2pPassphrase)
+    }
+
+    @Test
     fun `room database persists local account and saved peer without backend`() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = Room.inMemoryDatabaseBuilder(context, WiFiShareDatabase::class.java)

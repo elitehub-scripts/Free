@@ -1,7 +1,11 @@
 package com.example.screens
 
 import android.Manifest
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
@@ -196,6 +200,30 @@ fun ClientModeScreen(
                     icon = Icons.Default.Security,
                     tint = semantic.cyanAccent
                 )
+
+                if (!offlineP2pState.isWifiEnabled) {
+                    GlassCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        borderColor = semantic.warning.copy(alpha = 0.7f)
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            StatusPill("WI-FI RADIO OFF", semantic.warning)
+                            Text(
+                                text = "Turn on Wi-Fi (no router or internet needed) so WiFiShare can discover nearby Hosts, join Wi-Fi Direct SoftAPs, or connect over local Wi-Fi.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Button(
+                                onClick = { openClientWifiPanelOrSettings(context) },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("client_open_wifi_btn")
+                            ) {
+                                Text("Turn On Wi-Fi")
+                            }
+                        }
+                    }
+                }
 
                 // Sharing Code / Direct Endpoint Card
                 GlassCard(modifier = Modifier.fillMaxWidth()) {
@@ -461,6 +489,17 @@ fun ClientModeScreen(
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
+                                if (tunnelState.errorCode == "WIFI_OFF") {
+                                    Button(
+                                        onClick = { openClientWifiPanelOrSettings(context) },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(top = 4.dp)
+                                            .testTag("client_error_open_wifi_btn")
+                                    ) {
+                                        Text("Turn On Wi-Fi")
+                                    }
+                                }
                             }
                         }
                     }
@@ -605,10 +644,52 @@ fun ClientModeScreen(
                         Text(
                             text = offlineP2pState.statusMessage,
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = if (!offlineP2pState.isWifiEnabled) semantic.warning else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         p2pHint?.let { hint ->
                             Text(hint, style = MaterialTheme.typography.bodySmall, color = semantic.warning)
+                        }
+                        if (offlineP2pState.services.isNotEmpty()) {
+                            Text(
+                                "Available WiFiShare Hosts Nearby",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = semantic.cyanAccent
+                            )
+                            offlineP2pState.services.forEach { svc ->
+                                OutlinedButton(
+                                    onClick = {
+                                        val inviteUri = QrCodeGenerator.buildInviteUri(
+                                            code = svc.sharingCode,
+                                            hostIp = svc.p2pIp,
+                                            port = svc.hostPort,
+                                            hostPublicKeyB64 = "",
+                                            p2pIp = svc.p2pIp,
+                                            p2pSsid = svc.p2pSsid,
+                                            p2pPassphrase = svc.p2pPassphrase
+                                        )
+                                        codeInput = inviteUri
+                                        hostIpInput = svc.p2pIp
+                                        hostPortInput = svc.hostPort.toString()
+                                        if (svc.allowOpenOffline && svc.autoAcceptOpen) {
+                                            onRequestOfflineInternet(offlineNoteInput, svc.p2pIp, svc.hostPort)
+                                        } else if (svc.sharingCode.isNotBlank()) {
+                                            onRequestJoin(inviteUri, svc.p2pIp, svc.hostPort)
+                                        } else {
+                                            onConnectOfflineWifiDirectPeer(svc.deviceAddress)
+                                        }
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("client_p2p_service_${svc.deviceAddress}")
+                                ) {
+                                    val accessTag = when {
+                                        svc.autoAcceptOpen -> "Open Share"
+                                        svc.allowOpenOffline -> "Accepts Offline Req"
+                                        else -> svc.sharingCode
+                                    }
+                                    Text("${svc.deviceName} • $accessTag • ${svc.p2pSsid.ifBlank { "Wi-Fi Direct" }}")
+                                }
+                            }
                         }
                         if (offlineP2pState.peers.isNotEmpty()) {
                             offlineP2pState.peers.forEach { peer ->
@@ -650,6 +731,21 @@ fun ClientModeScreen(
                     }
                 }
             }
+        }
+    }
+}
+
+private fun openClientWifiPanelOrSettings(context: Context) {
+    val panelIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        Intent(Settings.Panel.ACTION_WIFI)
+    } else {
+        Intent(Settings.ACTION_WIFI_SETTINGS)
+    }.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    runCatching { context.startActivity(panelIntent) }.onFailure {
+        runCatching {
+            context.startActivity(
+                Intent(Settings.ACTION_WIFI_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
         }
     }
 }

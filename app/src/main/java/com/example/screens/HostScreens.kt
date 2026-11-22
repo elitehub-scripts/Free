@@ -1,6 +1,9 @@
 package com.example.screens
 
+import android.content.Context
 import android.content.Intent
+import android.os.Build
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -272,6 +275,13 @@ fun HostModeScreen(
                                 }
                             )
                         }
+
+                        ModeSwitchRow(
+                            title = "Open Wi-Fi Share (Auto-Accept Anyone Nearby)",
+                            checked = settings.autoAcceptOpenRequests,
+                            onCheckedChange = onUpdateAutoAcceptOpenRequests,
+                            switchTestTag = "host_auto_accept_open_switch"
+                        )
                     }
                 }
 
@@ -379,8 +389,18 @@ fun HostModeScreen(
                         Text(
                             text = offlineP2pState.statusMessage,
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = if (!offlineP2pState.isWifiEnabled) semantic.warning else MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                        if (!offlineP2pState.isWifiEnabled) {
+                            OutlinedButton(
+                                onClick = { openWifiPanelOrSettings(context) },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("host_open_wifi_btn")
+                            ) {
+                                Text("Turn On Wi-Fi (Required for Direct Sharing)")
+                            }
+                        }
                         if (offlineP2pState.isGroupActive && offlineP2pState.groupSsid.isNotBlank()) {
                             Text(
                                 text = "SSID: ${offlineP2pState.groupSsid}\nPassphrase: ${offlineP2pState.groupPassphrase}\nGateway IP: ${offlineP2pState.groupOwnerIp.ifBlank { "192.168.49.1" }}",
@@ -492,12 +512,6 @@ fun HostModeScreen(
                             onCheckedChange = onUpdateAllowOpenOfflineRequests,
                             switchTestTag = "host_allow_open_offline_switch"
                         )
-                        ModeSwitchRow(
-                            title = "Auto-Accept Anyone Nearby (Public Wi-Fi Share)",
-                            checked = settings.autoAcceptOpenRequests,
-                            onCheckedChange = onUpdateAutoAcceptOpenRequests,
-                            switchTestTag = "host_auto_accept_open_switch"
-                        )
 
                         Spacer(Modifier.height(4.dp))
                         Text(
@@ -573,6 +587,21 @@ private fun ModeSwitchRow(
             onCheckedChange = onCheckedChange,
             modifier = if (switchTestTag.isNotBlank()) Modifier.testTag(switchTestTag) else Modifier
         )
+    }
+}
+
+private fun openWifiPanelOrSettings(context: Context) {
+    val panelIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        Intent(Settings.Panel.ACTION_WIFI)
+    } else {
+        Intent(Settings.ACTION_WIFI_SETTINGS)
+    }.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    runCatching { context.startActivity(panelIntent) }.onFailure {
+        runCatching {
+            context.startActivity(
+                Intent(Settings.ACTION_WIFI_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }
     }
 }
 

@@ -29,6 +29,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import javax.net.SocketFactory
 
 private const val OP_ENCRYPTED_FRAME: Int = 0x01
 private const val OP_JOIN_REQUEST: Int = 0x10
@@ -496,7 +497,8 @@ class DirectClientConnector(
     private val stunEndpoint: String,
     private val scope: CoroutineScope,
     private val isOfflineRequest: Boolean = false,
-    private val requestNote: String = ""
+    private val requestNote: String = "",
+    private val socketFactory: SocketFactory? = null
 ) {
     @Volatile
     private var activeSocket: Socket? = null
@@ -525,7 +527,7 @@ class DirectClientConnector(
         onError: (Throwable) -> Unit
     ) = withContext(Dispatchers.IO) {
         try {
-            val socket = Socket()
+            val socket = socketFactory?.createSocket() ?: Socket()
             activeSocket = socket
             socket.connect(InetSocketAddress(InetAddress.getByName(hostIp), hostPort), 8_000)
             socket.tcpNoDelay = true
@@ -648,11 +650,12 @@ object DirectTcpProbe {
     suspend fun probeHost(
         hostIp: String,
         hostPort: Int,
-        timeoutMs: Int = 280
+        timeoutMs: Int = 280,
+        socketFactory: SocketFactory? = null
     ): DiscoveredHostPeer? = withContext(Dispatchers.IO) {
         if (hostIp.isBlank() || hostIp == "—" || hostPort !in 1..65535) return@withContext null
         runCatching {
-            Socket().use { socket ->
+            (socketFactory?.createSocket() ?: Socket()).use { socket ->
                 socket.connect(InetSocketAddress(InetAddress.getByName(hostIp), hostPort), timeoutMs)
                 socket.soTimeout = timeoutMs + 300
                 val out = DataOutputStream(socket.getOutputStream())

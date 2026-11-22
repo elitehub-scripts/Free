@@ -15,7 +15,10 @@ data class ParsedShareInvite(
     val code: String,
     val hostIp: String? = null,
     val hostPort: Int? = null,
-    val hostPublicKeyB64: String? = null
+    val hostPublicKeyB64: String? = null,
+    val p2pIp: String? = null,
+    val p2pSsid: String? = null,
+    val p2pPassphrase: String? = null
 )
 
 object QrCodeGenerator {
@@ -41,12 +44,26 @@ object QrCodeGenerator {
         code: String,
         hostIp: String,
         port: Int,
-        hostPublicKeyB64: String
+        hostPublicKeyB64: String,
+        p2pIp: String = "",
+        p2pSsid: String = "",
+        p2pPassphrase: String = ""
     ): String {
         val encCode = URLEncoder.encode(code, "UTF-8")
         val encHost = URLEncoder.encode(hostIp, "UTF-8")
         val encPub = URLEncoder.encode(hostPublicKeyB64, "UTF-8")
-        return "wifishare://join?code=$encCode&host=$encHost&port=$port&pub=$encPub"
+        return buildString {
+            append("wifishare://join?code=$encCode&host=$encHost&port=$port&pub=$encPub")
+            if (p2pIp.isNotBlank()) {
+                append("&p2pip=").append(URLEncoder.encode(p2pIp, "UTF-8"))
+            }
+            if (p2pSsid.isNotBlank()) {
+                append("&ssid=").append(URLEncoder.encode(p2pSsid, "UTF-8"))
+            }
+            if (p2pPassphrase.isNotBlank()) {
+                append("&pass=").append(URLEncoder.encode(p2pPassphrase, "UTF-8"))
+            }
+        }
     }
 
     /**
@@ -60,11 +77,17 @@ object QrCodeGenerator {
             val host = params["host"]?.trim()?.takeIf { it.isNotBlank() }
             val port = params["port"]?.toIntOrNull()?.takeIf { it in 1..65535 }
             val pub = params["pub"]?.trim()?.takeIf { it.isNotBlank() }
+            val p2pIp = params["p2pip"]?.trim()?.takeIf { it.isNotBlank() }
+            val p2pSsid = params["ssid"]?.trim()?.takeIf { it.isNotBlank() }
+            val p2pPass = params["pass"]?.trim()?.takeIf { it.isNotBlank() }
             return ParsedShareInvite(
                 code = code,
                 hostIp = host,
                 hostPort = port,
-                hostPublicKeyB64 = pub
+                hostPublicKeyB64 = pub,
+                p2pIp = p2pIp,
+                p2pSsid = p2pSsid,
+                p2pPassphrase = p2pPass
             )
         }
         val code = extractSharingCode(trimmed) ?: return null

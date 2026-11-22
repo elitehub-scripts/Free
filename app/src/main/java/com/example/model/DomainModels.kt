@@ -42,8 +42,21 @@ data class OfflineP2pPeer(
     val statusLabel: String
 )
 
+data class OfflineP2pService(
+    val deviceName: String,
+    val deviceAddress: String,
+    val sharingCode: String,
+    val hostPort: Int,
+    val p2pSsid: String = "",
+    val p2pPassphrase: String = "",
+    val p2pIp: String = "192.168.49.1",
+    val allowOpenOffline: Boolean = true,
+    val autoAcceptOpen: Boolean = false
+)
+
 data class OfflineP2pState(
     val isSupported: Boolean = false,
+    val isWifiEnabled: Boolean = true,
     val isEnabled: Boolean = false,
     val isDiscovering: Boolean = false,
     val isGroupActive: Boolean = false,
@@ -52,7 +65,8 @@ data class OfflineP2pState(
     val groupPassphrase: String = "",
     val groupOwnerIp: String = "",
     val statusMessage: String = "Idle",
-    val peers: List<OfflineP2pPeer> = emptyList()
+    val peers: List<OfflineP2pPeer> = emptyList(),
+    val services: List<OfflineP2pService> = emptyList()
 )
 
 sealed interface TunnelState {
